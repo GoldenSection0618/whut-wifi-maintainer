@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/
+env/
+.env
+config.toml
+
+# Legacy script with local credentials
+whut-dorm.py
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Cargo local/config cache
+.cargo/
+
+# IDE/editor local files
+.vscode/
+.idea/
+
+
+# Added by cargo
+
+/target
