@@ -56,22 +56,26 @@ pub fn current_campus_wifi() -> Option<CampusWifi> {
 #[cfg(not(windows))]
 pub fn current_campus_wifi() -> Option<CampusWifi> {
     // Linux/OpenWrt：路由器等设备通过有线接入校园网，无法像 Windows 那样
-    // 枚举 Wi-Fi SSID。只要存在可用的默认路由（WAN 口已获取地址），就视为
-    // 已接入校园网并开始保活。
-    has_default_route().then_some(CampusWifi::Wired)
+    // 枚举 Wi-Fi SSID。先确认默认路由存在（WAN 已获取地址），再探测校园网
+    // 认证门户，避免在家庭网络等非校园环境下向固定内网地址提交账号密码。
+    if !has_default_route() {
+        return None;
+    }
+
+    campus_portal_reachable().then_some(CampusWifi::Wired)
 }
 
 #[cfg(not(windows))]
 fn has_default_route() -> bool {
-    // 解析 /proc/net/route：Destination 为 00000000、Flags 含 RTF_UP(0x1)
-    // 且 Gateway 非零的行即为默认路由。
+    // 解析 /proc/net/route：Destination 为 00000000 且 Flags 含 RTF_UP(0x1)
+    // 的行即为默认路由。点对点链路（PPPoE 等）的 Gateway 可以为 0，不能据此排除。
     let Ok(content) = std::fs::read_to_string("/proc/net/route") else {
         return false;
     };
 
     content.lines().skip(1).any(|line| {
         let mut fields = line.split_whitespace();
-        let (_iface, Some(destination), Some(gateway), Some(flags)) = (
+        let (_iface, Some(destination), Some(_gateway), Some(flags)) = (
             fields.next(),
             fields.next(),
             fields.next(),
@@ -81,9 +85,37 @@ fn has_default_route() -> bool {
         };
 
         destination == "00000000"
-            && gateway != "00000000"
             && u32::from_str_radix(flags, 16).is_ok_and(|flags| flags & 0x1 != 0)
     })
+}
+
+#[cfg(not(windows))]
+fn campus_portal_reachable() -> bool {
+    // 探测校园网认证门户：仅当返回合法的 CSRF token 才视为处于校园网，
+    // 防止在其他网络环境下误向 172.30.21.100 提交认证请求。
+    use reqwest::blocking::Client;
+    use std::time::Duration;
+
+    use crate::portal_auth::CSRF_TOKEN_URL;
+
+    let Ok(client) = Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    else {
+        return false;
+    };
+
+    client
+        .get(CSRF_TOKEN_URL)
+        .send()
+        .ok()
+        .filter(|resp| resp.status().is_success())
+        .and_then(|resp| resp.json::<serde_json::Value>().ok())
+        .is_some_and(|json| {
+            json.get("csrf_token")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        })
 }
 
 pub fn balance_insufficient_tip(campus_wifi: CampusWifi) -> &'static str {

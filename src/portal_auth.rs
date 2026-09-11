@@ -8,7 +8,7 @@ use crate::USER_AGENT_VALUE;
 use crate::network::is_network_ok;
 
 const REDIRECT_URL: &str = "http://www.msftconnecttest.com/redirect";
-const CSRF_TOKEN_URL: &str = "http://172.30.21.100/api/csrf-token";
+pub(crate) const CSRF_TOKEN_URL: &str = "http://172.30.21.100/api/csrf-token";
 const LOGIN_URL: &str = "http://172.30.21.100/api/account/login";
 
 struct AuthContext {
