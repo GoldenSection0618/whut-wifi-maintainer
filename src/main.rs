@@ -16,6 +16,13 @@ const CHECK_INTERVAL_SECS: u64 = 30;
 const CAMPUS_CHECK_INTERVAL_SECS: u64 = 10;
 pub(crate) const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+#[cfg(windows)]
+const OUTSIDE_CAMPUS_MESSAGE: &str =
+    "[*] 当前未接入校园 Wi-Fi，等待连接 WHUT-WLAN、WHUT-DORM 或 WHUT-ISP。";
+#[cfg(not(windows))]
+const OUTSIDE_CAMPUS_MESSAGE: &str =
+    "[*] 当前未接入校园网（WAN 无默认路由），等待接入 WHUT-WLAN、WHUT-DORM、WHUT-ISP 或校园网有线口。";
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RuntimeState {
     Unknown,
@@ -43,6 +50,8 @@ fn prompt_until_verified(config: &mut Config, campus_wifi: CampusWifi) -> Runtim
             Ok(new_config) => *config = new_config,
             Err(err) => {
                 println!("[!] 未更新账号密码: {err}");
+                // 无交互终端（如路由器后台运行）时避免空转刷屏。
+                thread::sleep(Duration::from_secs(CAMPUS_CHECK_INTERVAL_SECS));
                 continue;
             }
         }
@@ -88,7 +97,7 @@ fn main() {
         // 不在目标校园 Wi-Fi 时不读取配置，也不发起认证请求。
         let Some(campus_wifi) = current_campus_wifi() else {
             if state != RuntimeState::OutsideCampus {
-                println!("[*] 当前未接入校园 Wi-Fi，等待连接 WHUT-WLAN、WHUT-DORM 或 WHUT-ISP。");
+                println!("{OUTSIDE_CAMPUS_MESSAGE}");
                 state = RuntimeState::OutsideCampus;
             }
 
@@ -115,7 +124,11 @@ fn main() {
                     println!("[!] 账号密码校验失败，请重新输入。");
                     match prompt_config() {
                         Ok(new_config) => *config = new_config,
-                        Err(err) => println!("[!] 未更新账号密码: {err}"),
+                        Err(err) => {
+                            println!("[!] 未更新账号密码: {err}");
+                            // 无交互终端时避免空转刷屏。
+                            thread::sleep(Duration::from_secs(CAMPUS_CHECK_INTERVAL_SECS));
+                        }
                     }
                     continue;
                 }

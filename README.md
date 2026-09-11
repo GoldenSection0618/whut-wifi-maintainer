@@ -13,3 +13,40 @@
 可你回到寝室之后，却发现电脑意外断网，任务已经中止甚至失败，一切又得重来……这是本仓库希望能解决的问题。
 
 本仓库提供一个程序，能够检测电脑上是否已经断开网络，并在断网的第一时间重新认证，快速重连。
+
+## 使用方法
+
+### Windows
+
+1. 从 Releases 下载或在本地执行 `cargo build --release` 编译；
+2. 运行 `whut-wifi-maintainer.exe`（或双击 `run.cmd`），首次运行会提示输入校园网账号密码；
+3. 账号密码会保存到程序同目录的 `config.toml`，之后自动读取。
+
+### Linux / OpenWrt（路由器常驻保活）
+
+Linux 下程序无法枚举 Wi-Fi SSID，改为通过 **WAN 口默认路由**判断是否已接入校园网：只要存在默认路由（WAN 已获取地址）即开始保活，适合将路由器有线接入校园网后 7×24 小时保持在线。
+
+交叉编译静态二进制（以 aarch64 路由器为例）：
+
+```sh
+rustup target add aarch64-unknown-linux-musl
+cargo build --release --target aarch64-unknown-linux-musl
+# 产物：target/aarch64-unknown-linux-musl/release/whut-wifi-maintainer
+```
+
+在路由器上运行：
+
+```sh
+mkdir -p /root/whut-wifi-maintainer
+# 将编译产物和 config.toml 放入该目录
+cd /root/whut-wifi-maintainer && ./whut-wifi-maintainer
+```
+
+配置文件（`config.toml`，与程序同目录，不存在时首次运行会提示输入）：
+
+```toml
+username = "你的学号"
+password = "你的密码"
+```
+
+程序每 30 秒检测一次 `http://www.msftconnecttest.com/connecttest.txt` 是否返回预期内容，一旦发现断网立即重新认证，通常在 30~60 秒内恢复。

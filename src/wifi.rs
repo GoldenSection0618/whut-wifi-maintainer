@@ -4,10 +4,14 @@ use windows::Networking::Connectivity::{NetworkConnectivityLevel, NetworkInforma
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // 各平台仅构造部分变体：Windows 为 Wi-Fi SSID，Linux 为有线接入。
 pub enum CampusWifi {
     Wlan,
     Dorm,
     Isp,
+    /// 有线接入校园网（Linux/OpenWrt 路由器等场景）。
+    #[cfg(not(windows))]
+    Wired,
 }
 
 #[cfg(windows)]
@@ -21,6 +25,7 @@ pub fn initialize_windows_runtime() {
 #[cfg(not(windows))]
 pub fn initialize_windows_runtime() {}
 
+#[cfg(any(windows, test))]
 fn campus_wifi(ssid: &str) -> Option<CampusWifi> {
     match ssid {
         "WHUT-WLAN" => Some(CampusWifi::Wlan),
@@ -50,7 +55,35 @@ pub fn current_campus_wifi() -> Option<CampusWifi> {
 
 #[cfg(not(windows))]
 pub fn current_campus_wifi() -> Option<CampusWifi> {
-    None
+    // Linux/OpenWrt：路由器等设备通过有线接入校园网，无法像 Windows 那样
+    // 枚举 Wi-Fi SSID。只要存在可用的默认路由（WAN 口已获取地址），就视为
+    // 已接入校园网并开始保活。
+    has_default_route().then_some(CampusWifi::Wired)
+}
+
+#[cfg(not(windows))]
+fn has_default_route() -> bool {
+    // 解析 /proc/net/route：Destination 为 00000000、Flags 含 RTF_UP(0x1)
+    // 且 Gateway 非零的行即为默认路由。
+    let Ok(content) = std::fs::read_to_string("/proc/net/route") else {
+        return false;
+    };
+
+    content.lines().skip(1).any(|line| {
+        let mut fields = line.split_whitespace();
+        let (_iface, Some(destination), Some(gateway), Some(flags)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            return false;
+        };
+
+        destination == "00000000"
+            && gateway != "00000000"
+            && u32::from_str_radix(flags, 16).is_ok_and(|flags| flags & 0x1 != 0)
+    })
 }
 
 pub fn balance_insufficient_tip(campus_wifi: CampusWifi) -> &'static str {
@@ -60,6 +93,10 @@ pub fn balance_insufficient_tip(campus_wifi: CampusWifi) -> &'static str {
         }
         CampusWifi::Isp => "WHUT-ISP 余额不足，请通过对应运营商渠道充值。",
         CampusWifi::Wlan => "WHUT-WLAN 不收费，认证服务器返回了异常计费结果。",
+        #[cfg(not(windows))]
+        CampusWifi::Wired => {
+            "有线校园网余额不足，请到 selfaaa.whut.edu.cn 或 cwsf.whut.edu.cn 充值。"
+        }
     }
 }
 
