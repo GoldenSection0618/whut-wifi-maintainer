@@ -20,8 +20,20 @@ pub(crate) const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; 
 const OUTSIDE_CAMPUS_MESSAGE: &str =
     "[*] 当前未接入校园 Wi-Fi，等待连接 WHUT-WLAN、WHUT-DORM 或 WHUT-ISP。";
 #[cfg(not(windows))]
-const OUTSIDE_CAMPUS_MESSAGE: &str =
-    "[*] 当前未接入校园网（WAN 无默认路由），等待接入 WHUT-WLAN、WHUT-DORM、WHUT-ISP 或校园网有线口。";
+const NO_DEFAULT_ROUTE_MESSAGE: &str = "[*] 当前未接入校园网（WAN 无默认路由），等待接入 WHUT-WLAN、WHUT-DORM、WHUT-ISP 或校园网有线口。";
+#[cfg(not(windows))]
+const PORTAL_UNREACHABLE_MESSAGE: &str =
+    "[*] WAN 已有默认路由，但无法访问校园网认证门户，等待接入 WHUT 校园网。";
+
+// 提示语与实际判断保持一致：无默认路由与门户不可达是两种不同的等待原因。
+#[cfg(not(windows))]
+fn outside_campus_message() -> &'static str {
+    if wifi::has_default_route() {
+        PORTAL_UNREACHABLE_MESSAGE
+    } else {
+        NO_DEFAULT_ROUTE_MESSAGE
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RuntimeState {
@@ -97,7 +109,11 @@ fn main() {
         // 不在目标校园 Wi-Fi 时不读取配置，也不发起认证请求。
         let Some(campus_wifi) = current_campus_wifi() else {
             if state != RuntimeState::OutsideCampus {
-                println!("{OUTSIDE_CAMPUS_MESSAGE}");
+                #[cfg(windows)]
+                let message = OUTSIDE_CAMPUS_MESSAGE;
+                #[cfg(not(windows))]
+                let message = outside_campus_message();
+                println!("{message}");
                 state = RuntimeState::OutsideCampus;
             }
 

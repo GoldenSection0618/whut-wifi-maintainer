@@ -66,21 +66,23 @@ pub fn current_campus_wifi() -> Option<CampusWifi> {
 }
 
 #[cfg(not(windows))]
-fn has_default_route() -> bool {
-    // 解析 /proc/net/route：Destination 为 00000000 且 Flags 含 RTF_UP(0x1)
-    // 的行即为默认路由。点对点链路（PPPoE 等）的 Gateway 可以为 0，不能据此排除。
+pub(crate) fn has_default_route() -> bool {
     let Ok(content) = std::fs::read_to_string("/proc/net/route") else {
         return false;
     };
 
+    has_default_route_in(&content)
+}
+
+// 解析 /proc/net/route 内容：Destination 为 00000000 且 Flags 含 RTF_UP(0x1)
+// 的行即为默认路由。点对点链路（PPPoE 等）的 Gateway 可以为 0，不能据此排除。
+#[cfg(any(not(windows), test))]
+fn has_default_route_in(content: &str) -> bool {
     content.lines().skip(1).any(|line| {
         let mut fields = line.split_whitespace();
-        let (_iface, Some(destination), Some(_gateway), Some(flags)) = (
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-        ) else {
+        let (_iface, Some(destination), Some(_gateway), Some(flags)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
             return false;
         };
 
@@ -98,10 +100,7 @@ fn campus_portal_reachable() -> bool {
 
     use crate::portal_auth::CSRF_TOKEN_URL;
 
-    let Ok(client) = Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-    else {
+    let Ok(client) = Client::builder().timeout(Duration::from_secs(3)).build() else {
         return false;
     };
 
@@ -110,12 +109,22 @@ fn campus_portal_reachable() -> bool {
         .send()
         .ok()
         .filter(|resp| resp.status().is_success())
-        .and_then(|resp| resp.json::<serde_json::Value>().ok())
-        .is_some_and(|json| {
+        .and_then(|resp| resp.text().ok())
+        .is_some_and(|body| portal_response_has_csrf_token(&body))
+}
+
+// 仅当门户返回非空 CSRF token 才视为处于校园网；
+// 缺失字段、空字符串、非法 JSON 一律视为不在校园网。
+#[cfg(any(not(windows), test))]
+fn portal_response_has_csrf_token(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| {
             json.get("csrf_token")
                 .and_then(serde_json::Value::as_str)
-                .is_some()
+                .map(|token| !token.is_empty())
         })
+        .unwrap_or(false)
 }
 
 pub fn balance_insufficient_tip(campus_wifi: CampusWifi) -> &'static str {
@@ -134,7 +143,7 @@ pub fn balance_insufficient_tip(campus_wifi: CampusWifi) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::campus_wifi;
+    use super::{campus_wifi, has_default_route_in, portal_response_has_csrf_token};
 
     #[test]
     fn recognizes_campus_wifi_ssids() {
@@ -143,5 +152,60 @@ mod tests {
         assert!(campus_wifi("WHUT-ISP").is_some());
         assert!(campus_wifi("WHUT-WLAN-Guest").is_none());
         assert!(campus_wifi("OtherWiFi").is_none());
+    }
+
+    // /proc/net/route 的表头
+    const ROUTE_HEADER: &str =
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n";
+
+    #[test]
+    fn detects_normal_default_route() {
+        let table = format!(
+            "{ROUTE_HEADER}eth0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+             eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n"
+        );
+        assert!(has_default_route_in(&table));
+    }
+
+    #[test]
+    fn detects_zero_gateway_default_route() {
+        // PPPoE 等点对点链路：Gateway 为 0 的默认路由同样有效。
+        let table =
+            format!("{ROUTE_HEADER}ppp0\t00000000\t00000000\t0003\t0\t0\t0\t00000000\t0\t0\t0\n");
+        assert!(has_default_route_in(&table));
+    }
+
+    #[test]
+    fn rejects_route_table_without_usable_default_route() {
+        // 只有普通网段路由，没有默认路由
+        let no_default =
+            format!("{ROUTE_HEADER}eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n");
+        assert!(!has_default_route_in(&no_default));
+
+        // 有默认路由但接口未 UP（Flags 不含 RTF_UP）
+        let down =
+            format!("{ROUTE_HEADER}eth0\t00000000\t0101A8C0\t0000\t0\t0\t0\t00000000\t0\t0\t0\n");
+        assert!(!has_default_route_in(&down));
+
+        // 空表 / 只有表头
+        assert!(!has_default_route_in(ROUTE_HEADER));
+        assert!(!has_default_route_in(""));
+    }
+
+    #[test]
+    fn accepts_valid_csrf_token_response() {
+        assert!(portal_response_has_csrf_token(
+            r#"{"csrf_token":"jw_8-3wDi2wj4Ayi7bYYmGQXbtk="}"#
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_or_empty_csrf_token() {
+        // 空 token 不可用，必须拒绝
+        assert!(!portal_response_has_csrf_token(r#"{"csrf_token":""}"#));
+        // 字段缺失
+        assert!(!portal_response_has_csrf_token(r#"{"code":0}"#));
+        // 非法 JSON
+        assert!(!portal_response_has_csrf_token("not json"));
     }
 }
