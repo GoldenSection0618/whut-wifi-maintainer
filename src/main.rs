@@ -106,7 +106,10 @@ fn main() {
     #[cfg(windows)]
     let mut config = None;
     #[cfg(not(windows))]
-    let mut config = config::load_wired_config();
+    let mut config = config::load_wired_config().unwrap_or_else(|error| {
+        eprintln!("[!] {error}");
+        std::process::exit(1);
+    });
     let mut credentials_verified = false;
     let mut state = RuntimeState::Unknown;
 
