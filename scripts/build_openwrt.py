@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import tomllib
 
 
@@ -71,9 +72,13 @@ def main() -> None:
     architecture = re.search(r'^CONFIG_TARGET_ARCH_PACKAGES="([^"]+)"$', config, re.M)
     if not architecture:
         raise RuntimeError("SDK did not report its package architecture")
-    binaries = list((sdk / "build_dir").glob(f"target-*/{package}-{version}/.pkgdir/{package}/usr/bin/{package}"))
-    if len(binaries) != 1:
-        raise RuntimeError(f"Expected one installed binary, found {len(binaries)}")
+    # SDK package stripping can change bytes after .pkgdir is populated.
+    # The distributable binary must be exactly the one installed by the final APK.
+    with tempfile.TemporaryDirectory(prefix="whut-apk-") as directory:
+        extracted = Path(directory)
+        run(str(sdk / "staging_dir/host/bin/apk"), "extract", "--allow-untrusted", "--no-chown",
+            "--destination", str(extracted), str(packages[0]), cwd=sdk)
+        binary_data = (extracted / "usr/bin" / package).read_bytes()
     version_metadata = (sdk / "include/version.mk").read_text()
     sdk_version = re.search(r"^VERSION_NUMBER:.*,(\d+\.\d+\.\d+)\)$", version_metadata, re.M)
     if not sdk_version:
@@ -82,7 +87,8 @@ def main() -> None:
     artifact = output / packages[0].name
     binary = output / package
     shutil.copy2(packages[0], artifact)
-    shutil.copy2(binaries[0], binary)
+    binary.write_bytes(binary_data)
+    binary.chmod(0o755)
     manifest = {
         "version": version, "source_commit": commit, "source_archive_sha256": sha256(archive),
         "architecture": architecture[1],
