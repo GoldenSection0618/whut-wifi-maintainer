@@ -1,23 +1,17 @@
+use crate::network::RequestError;
+use crate::protocol::{
+    UNIFIED_LOGIN_URL, UNIFIED_RSA_URL, UNIFIED_SERVICE_URL, credentials_rejected,
+};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use rand::rngs::OsRng;
 use regex::Regex;
 use reqwest::blocking::Client;
 use reqwest::header::LOCATION;
-use reqwest::redirect::Policy;
 use rsa::pkcs8::DecodePublicKey;
 use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
 use serde::Deserialize;
 use std::error::Error;
-use std::time::Duration;
-
-use crate::USER_AGENT_VALUE;
-use crate::network::client_builder;
-
-const UNIFIED_LOGIN_URL: &str =
-    "https://zhlgd.whut.edu.cn/tpass/login?service=https%3A%2F%2Fzhlgd.whut.edu.cn%2Ftp_up%2F";
-const UNIFIED_RSA_URL: &str = "https://zhlgd.whut.edu.cn/tpass/rsa?skipWechat=true";
-const UNIFIED_SERVICE_URL: &str = "https://zhlgd.whut.edu.cn/tp_up/";
 
 #[derive(Deserialize)]
 struct RsaKeyResponse {
@@ -29,15 +23,6 @@ pub enum CredentialVerification {
     Valid,
     Invalid,
     Inconclusive,
-}
-
-fn build_client(wired_interface: Option<&str>) -> Result<Client, Box<dyn Error>> {
-    Ok(client_builder(wired_interface)
-        .cookie_store(true)
-        // 成功与否由登录接口的重定向目标判定，不能自动跟随。
-        .redirect(Policy::none())
-        .user_agent(USER_AGENT_VALUE)
-        .build()?)
 }
 
 fn hidden_input_value(html: &str, id: &str) -> Result<Option<String>, Box<dyn Error>> {
@@ -77,35 +62,32 @@ fn encrypt(public_key: &RsaPublicKey, value: &str) -> Result<String, Box<dyn Err
 }
 
 pub fn verify_credentials(
+    client: &Client,
     username: &str,
     password: &str,
-    wired_interface: Option<&str>,
-) -> Result<CredentialVerification, Box<dyn Error>> {
-    let client = build_client(wired_interface)?;
-
+) -> Result<CredentialVerification, RequestError> {
     // 登录页会建立会话 Cookie，并提供本次提交所需的 lt。
-    let login_page = client
-        .get(UNIFIED_LOGIN_URL)
-        .timeout(Duration::from_secs(10))
-        .send()?
-        .error_for_status()?;
+    let login_page = client.get(UNIFIED_LOGIN_URL).send()?.error_for_status()?;
     let login_html = login_page.text()?;
-    let lt = hidden_input_value(&login_html, "lt")?
+    let lt = hidden_input_value(&login_html, "lt")
+        .map_err(|_| RequestError::Protocol)?
         .filter(|value| !value.is_empty())
-        .ok_or("统一认证登录页未提供 lt 字段")?;
+        .ok_or(RequestError::Protocol)?;
 
     let key_response: RsaKeyResponse = client
         .post(UNIFIED_RSA_URL)
-        .timeout(Duration::from_secs(10))
         .send()?
         .error_for_status()?
         .json()?;
-    let public_key_der = BASE64_STANDARD.decode(key_response.public_key)?;
-    let public_key = RsaPublicKey::from_public_key_der(&public_key_der)?;
+    let public_key_der = BASE64_STANDARD
+        .decode(key_response.public_key)
+        .map_err(|_| RequestError::Protocol)?;
+    let public_key =
+        RsaPublicKey::from_public_key_der(&public_key_der).map_err(|_| RequestError::Protocol)?;
 
     // 与浏览器一致：使用服务端当前公钥加密账号和密码后再提交。
-    let encrypted_username = encrypt(&public_key, username)?;
-    let encrypted_password = encrypt(&public_key, password)?;
+    let encrypted_username = encrypt(&public_key, username).map_err(|_| RequestError::Protocol)?;
+    let encrypted_password = encrypt(&public_key, password).map_err(|_| RequestError::Protocol)?;
     let login_response = client
         .post(UNIFIED_LOGIN_URL)
         .form(&[
@@ -118,7 +100,6 @@ pub fn verify_credentials(
             ("execution", "e1s1"),
             ("_eventId", "submit"),
         ])
-        .timeout(Duration::from_secs(10))
         .send()?;
 
     if login_response.status().is_redirection() {
@@ -126,22 +107,27 @@ pub fn verify_credentials(
             .headers()
             .get(LOCATION)
             .and_then(|value| value.to_str().ok())
-            .ok_or("统一认证成功重定向缺少 Location 响应头")?;
+            .ok_or(RequestError::Protocol)?;
 
-        if location.starts_with(UNIFIED_SERVICE_URL) {
+        if reqwest::Url::parse(location).is_ok_and(|url| {
+            let expected = reqwest::Url::parse(UNIFIED_SERVICE_URL).expect("constant URL");
+            url.origin() == expected.origin() && url.path() == expected.path()
+        }) {
             return Ok(CredentialVerification::Valid);
         }
 
-        return Err(format!("统一认证重定向到了未预期地址: {location}").into());
+        return Err(RequestError::Protocol);
     }
 
     if !login_response.status().is_success() {
-        return Err(format!("统一认证返回 HTTP {}", login_response.status()).into());
+        return Err(RequestError::Status(login_response.status().as_u16()));
     }
 
     let response_html = login_response.text()?;
-    if let Some(message) = unified_error_message(&response_html)? {
-        println!("[-] 统一认证失败: {message}");
+    if unified_error_message(&response_html)
+        .map_err(|_| RequestError::Protocol)?
+        .is_some_and(|message| credentials_rejected(&message))
+    {
         return Ok(CredentialVerification::Invalid);
     }
 

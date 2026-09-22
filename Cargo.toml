@@ -1,9 +1,12 @@
 [package]
 name = "whut-wifi-maintainer"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+thiserror = "2"
 base64 = "0.22"
 rand = "0.8"
 regex = "1"

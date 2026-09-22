@@ -1,48 +1,36 @@
 mod config;
+mod monitor;
 mod network;
 mod portal_auth;
+mod protocol;
+#[cfg(test)]
+mod test_support;
 mod unified_auth;
 mod wifi;
 
-#[cfg(windows)]
-use config::load_or_prompt_config;
-use config::{Config, prompt_config, save_config};
-use network::is_network_ok;
-use portal_auth::{PortalLoginOutcome, login};
-use std::io::IsTerminal;
-use std::thread;
-use std::time::Duration;
-use unified_auth::{CredentialVerification, verify_credentials};
-#[cfg(windows)]
-use wifi::current_campus_wifi;
-#[cfg(not(windows))]
-use wifi::current_campus_wifi_detailed;
-use wifi::{CampusWifi, balance_insufficient_tip, initialize_windows_runtime};
+use clap::Parser;
+use config::{Config, ConfigError, ConfigStore, Credentials};
+use monitor::{Action, Monitor};
+use network::{HttpClients, Reachability};
+use portal_auth::PortalLoginOutcome;
+use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::time::{Duration, Instant};
+use unified_auth::CredentialVerification;
 
-const CHECK_INTERVAL_SECS: u64 = 30;
-const CAMPUS_CHECK_INTERVAL_SECS: u64 = 10;
-pub(crate) const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
-#[cfg(windows)]
-const OUTSIDE_CAMPUS_MESSAGE: &str =
-    "[*] 当前未接入校园 Wi-Fi，等待连接 WHUT-WLAN、WHUT-DORM 或 WHUT-ISP。";
-
-// 等待间隔只应用于非交互 stdin（如路由器后台运行），
-// 交互终端用户应能立即重新输入。
-fn sleep_if_non_interactive() {
-    if !std::io::stdin().is_terminal() {
-        thread::sleep(Duration::from_secs(CAMPUS_CHECK_INTERVAL_SECS));
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RuntimeState {
-    Unknown,
-    OutsideCampus(&'static str),
-    NetworkOk,
-    NetworkUnavailable,
-    AlreadyOnline,
-    BalanceInsufficient,
+#[derive(Parser)]
+#[command(version, about = "WHUT 校园网保持器")]
+struct Cli {
+    /// 使用指定配置；不存在或无效时直接失败，不查找其他文件。
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// 后台模式：凭据错误时退出，绝不请求终端输入。
+    #[arg(long)]
+    non_interactive: bool,
+    /// 只校验配置，不发送网络请求、不修改文件。
+    #[arg(long)]
+    check_config: bool,
 }
 
 #[cfg(windows)]
@@ -52,182 +40,282 @@ fn configure_console() {
         windows_sys::Win32::System::Console::SetConsoleCP(65001);
     }
 }
-
 #[cfg(not(windows))]
 fn configure_console() {}
 
-fn prompt_until_verified(config: &mut Config, campus_wifi: CampusWifi) -> RuntimeState {
-    loop {
-        match prompt_config() {
-            Ok(new_config) => config.update_credentials(new_config),
-            Err(err) => {
-                println!("[!] 未更新账号密码: {err}");
-                sleep_if_non_interactive();
-                continue;
-            }
-        }
+fn prompt_credentials() -> Result<Credentials, String> {
+    print!("请输入校园网账号: ");
+    io::stdout().flush().map_err(|_| "无法显示输入提示")?;
+    let mut username = String::new();
+    if io::stdin()
+        .read_line(&mut username)
+        .map_err(|_| "读取账号失败")?
+        == 0
+    {
+        return Err("输入已结束，请修正配置后重启".into());
+    }
+    print!("请输入校园网密码: ");
+    io::stdout().flush().map_err(|_| "无法显示输入提示")?;
+    let mut password = String::new();
+    if io::stdin()
+        .read_line(&mut password)
+        .map_err(|_| "读取密码失败")?
+        == 0
+    {
+        return Err("输入已结束，请修正配置后重启".into());
+    }
+    // Remove the line ending, not meaningful spaces in a password.
+    let password = password.trim_end_matches(['\r', '\n']).to_owned();
+    if username.trim().is_empty() || password.is_empty() {
+        return Err("账号或密码为空".into());
+    }
+    Ok(Credentials {
+        username: username.trim().into(),
+        password,
+    })
+}
 
-        match login(
-            &config.username,
-            &config.password,
-            true,
-            config.wired_interface(),
-        ) {
-            Ok(PortalLoginOutcome::Verified) => {
-                if let Err(err) = save_config(config) {
-                    println!("[!] 账号密码可用，但保存失败: {err}");
-                }
-                println!("[+] 认证成功，网络已恢复。");
-                return RuntimeState::NetworkOk;
-            }
-            Ok(PortalLoginOutcome::Rejected) => {
-                println!("[!] 账号密码仍然不正确，请重新输入。");
-            }
-            Ok(PortalLoginOutcome::Inconclusive) => {
-                println!("[!] 当前设备已经在线，无法确认刚输入的密码是否正确；配置未更新。");
-                return RuntimeState::AlreadyOnline;
-            }
-            Ok(PortalLoginOutcome::BalanceInsufficient) => {
-                println!("[!] {}", balance_insufficient_tip(campus_wifi));
-                return RuntimeState::BalanceInsufficient;
-            }
-            Err(err) => {
-                println!("[!] 重试认证异常: {err}");
-                return RuntimeState::NetworkUnavailable;
-            }
+fn replacement_credentials(interactive: bool) -> Result<Credentials, String> {
+    if !interactive {
+        return Err("凭据被明确拒绝；后台模式已退出，请修正配置后重启服务".into());
+    }
+    loop {
+        match prompt_credentials() {
+            Ok(value) => return Ok(value),
+            Err(error) if error == "账号或密码为空" => eprintln!("[!] {error}"),
+            Err(error) => return Err(error),
         }
     }
 }
 
-fn main() {
-    configure_console();
-    initialize_windows_runtime();
-
+fn campus_connection(config: &Config) -> Result<wifi::CampusWifi, &'static str> {
     #[cfg(windows)]
-    let mut config = None;
+    {
+        let _ = config;
+        wifi::current_campus_wifi().ok_or("当前未连接 WHUT-WLAN、WHUT-DORM 或 WHUT-ISP")
+    }
     #[cfg(not(windows))]
-    let mut config = config::load_wired_config();
-    let mut credentials_verified = false;
-    let mut state = RuntimeState::Unknown;
+    {
+        wifi::current_campus_wifi_detailed(config).map_err(|reason| reason.message())
+    }
+}
 
-    println!("WHUT WiFi 保持器已启动。");
+fn report_change(previous: &mut String, message: &str) {
+    if previous != message {
+        println!("{message}");
+        *previous = message.to_owned();
+    }
+}
+
+fn validate_platform(config: &Config) -> Result<(), String> {
+    #[cfg(not(windows))]
+    if config.wired_interface().is_none() {
+        return Err("Linux/OpenWrt 必须设置 wired = true 并绑定 wired_interface".into());
+    }
+    #[cfg(windows)]
+    if config.wired {
+        return Err("Windows 使用校园 Wi-Fi 检测，请设置 wired = false".into());
+    }
+    Ok(())
+}
+
+fn run(cli: Cli) -> Result<(), String> {
+    if !cli.check_config {
+        wifi::initialize_windows_runtime();
+    }
+    let explicit = cli.config.is_some();
+    let interactive = !cli.non_interactive && io::stdin().is_terminal();
+    let store = ConfigStore::resolve(cli.config).map_err(|e| e.to_string())?;
+    let mut pending_credentials = false;
+    let mut config = match store.load() {
+        Ok(config) => config,
+        Err(ConfigError::Io(error))
+            if error.kind() == io::ErrorKind::NotFound
+                && !explicit
+                && interactive
+                && !cli.check_config
+                && cfg!(windows) =>
+        {
+            // Preserve Windows' SSID gate before requesting credentials.
+            while wifi_connection_missing() {
+                println!("[*] 等待连接校园 Wi-Fi。");
+                std::thread::sleep(Duration::from_secs(10));
+            }
+            pending_credentials = true;
+            Config::new(replacement_credentials(true)?)
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    config.validate().map_err(|e| e.to_string())?;
+    validate_platform(&config)?;
+    if cli.check_config {
+        println!("[+] 配置有效: {}", store.path().display());
+        return Ok(());
+    }
+    let clients = HttpClients::new(&config).map_err(|e| e.to_string())?;
+    let interval = Duration::from_secs(config.monitor.interval_secs);
+    let mut monitor = Monitor::new(interval);
+    let started = Instant::now();
+    let mut next_verification = Duration::ZERO;
+    let mut verified = false;
+    let mut previous = String::new();
+    println!("WHUT 校园网保持器已启动；配置: {}", store.path().display());
 
     loop {
-        // Windows 先检查 SSID；Linux 先读取显式有线配置。
-        // 网络检测通过前不发起认证请求。
-        #[cfg(windows)]
-        let (campus_wifi, outside_message) = (current_campus_wifi(), OUTSIDE_CAMPUS_MESSAGE);
-        #[cfg(not(windows))]
-        let (campus_wifi, outside_message) = match current_campus_wifi_detailed(&config) {
-            Ok(wifi) => (Some(wifi), ""),
-            Err(reason) => (None, reason.message()),
-        };
-
-        let Some(campus_wifi) = campus_wifi else {
-            if state != RuntimeState::OutsideCampus(outside_message) {
-                println!("{outside_message}");
-                state = RuntimeState::OutsideCampus(outside_message);
+        let connection = match campus_connection(&config) {
+            Ok(connection) => connection,
+            Err(message) => {
+                monitor.disconnected();
+                report_change(&mut previous, message);
+                std::thread::sleep(interval);
+                continue;
             }
-
-            thread::sleep(Duration::from_secs(CAMPUS_CHECK_INTERVAL_SECS));
-            continue;
         };
-
-        #[cfg(windows)]
-        let config = config.get_or_insert_with(load_or_prompt_config);
-        #[cfg(not(windows))]
-        let config = &mut config;
-        let network_ok = is_network_ok(config.wired_interface());
-
-        // 每次进程启动后只在已有网络时校验一次统一认证凭据。
-        if !credentials_verified && network_ok {
-            println!("[*] 当前网络已连接，正在通过统一认证校验账号密码...");
-
-            match verify_credentials(&config.username, &config.password, config.wired_interface()) {
-                Ok(CredentialVerification::Valid) => {
-                    if let Err(err) = save_config(config) {
-                        println!("[!] 账号密码校验成功，但保存失败: {err}");
+        let report = network::probe(&clients.probe, &config.monitor);
+        let reachability = report.reachability();
+        let now = started.elapsed();
+        match monitor.observe(reachability, now) {
+            Action::Healthy => {
+                report_change(&mut previous, "[+] HTTP 与 HTTPS 探测均通过，网络正常。")
+            }
+            Action::Partial => report_change(
+                &mut previous,
+                &format!(
+                    "[!] 网络部分可达；HTTP={:?} HTTPS={:?}，本轮不重新认证。",
+                    report.http, report.https
+                ),
+            ),
+            Action::Wait => report_change(
+                &mut previous,
+                "[!] 外网探测未通过，等待下一轮确认或重试间隔。",
+            ),
+            Action::Authenticate => {
+                monitor.attempted(now);
+                // Portal reachability is an authentication prerequisite, not an internet health signal.
+                match portal_auth::reachable(&clients.portal) {
+                    Err(error) => {
+                        report_change(&mut previous, &format!("[!] 认证门户不可用: {error}"))
                     }
-                    println!("[+] 账号密码校验成功。");
-                    credentials_verified = true;
+                    Ok(()) => match portal_auth::login(
+                        &clients.portal,
+                        &clients.discovery,
+                        &config.username,
+                        &config.password,
+                        &config.portal.fallback_nas_id,
+                    ) {
+                        Ok(PortalLoginOutcome::Accepted) => {
+                            report_change(
+                                &mut previous,
+                                "[*] 认证请求已被接受，正在复核外网连通性。",
+                            );
+                            let after = network::probe(&clients.probe, &config.monitor);
+                            if after.reachability() == Reachability::Online {
+                                monitor.observe(Reachability::Online, started.elapsed());
+                                report_change(
+                                    &mut previous,
+                                    "[+] HTTP 与 HTTPS 探测均通过，网络已恢复。",
+                                );
+                            } else {
+                                report_change(
+                                    &mut previous,
+                                    "[!] 认证请求已被接受，但外网尚未完全恢复。",
+                                );
+                            }
+                        }
+                        Ok(PortalLoginOutcome::CredentialsRejected) => {
+                            config.update_credentials(replacement_credentials(interactive)?);
+                            verified = false;
+                            pending_credentials = true;
+                            next_verification = Duration::ZERO;
+                        }
+                        Ok(PortalLoginOutcome::BalanceInsufficient) => {
+                            report_change(&mut previous, wifi::balance_insufficient_tip(connection))
+                        }
+                        Ok(PortalLoginOutcome::Inconclusive) => {
+                            report_change(&mut previous, "[!] 门户未返回明确认证结果，将稍后重试。")
+                        }
+                        Err(error) => {
+                            report_change(&mut previous, &format!("[!] 认证请求失败: {error}"))
+                        }
+                    },
+                }
+            }
+        }
+
+        // A temporary unified-auth failure must not suspend connectivity monitoring.
+        if reachability == Reachability::Online && !verified && now >= next_verification {
+            next_verification = now.saturating_add(interval.max(Duration::from_secs(30)));
+            match unified_auth::verify_credentials(
+                &clients.unified,
+                &config.username,
+                &config.password,
+            ) {
+                Ok(CredentialVerification::Valid) => {
+                    verified = true;
+                    if pending_credentials {
+                        store.save(&config).map_err(|e| e.to_string())?;
+                        pending_credentials = false;
+                        println!("[+] 新凭据已验证并保存。");
+                    }
                 }
                 Ok(CredentialVerification::Invalid) => {
-                    println!("[!] 账号密码校验失败，请重新输入。");
-                    match prompt_config() {
-                        Ok(new_config) => config.update_credentials(new_config),
-                        Err(err) => {
-                            println!("[!] 未更新账号密码: {err}");
-                            sleep_if_non_interactive();
-                        }
-                    }
+                    config.update_credentials(replacement_credentials(interactive)?);
+                    pending_credentials = true;
+                    // Interactive users can verify a correction without the background retry delay.
+                    next_verification = Duration::ZERO;
                     continue;
                 }
                 Ok(CredentialVerification::Inconclusive) => {
-                    println!("[!] 统一认证未返回明确结果，10 秒后重试。");
-                    thread::sleep(Duration::from_secs(CAMPUS_CHECK_INTERVAL_SECS));
-                    continue;
+                    eprintln!("[!] 凭据校验结果不明确；继续监测网络，稍后重试。")
                 }
-                Err(err) => {
-                    println!("[!] 无法完成统一认证校验: {err}");
-                    println!("[!] 10 秒后重试。");
-                    thread::sleep(Duration::from_secs(CAMPUS_CHECK_INTERVAL_SECS));
-                    continue;
-                }
+                Err(error) => eprintln!("[!] 凭据校验暂不可用: {error}；继续监测网络。"),
             }
         }
+        std::thread::sleep(interval);
+    }
+}
 
-        if network_ok {
-            if state != RuntimeState::NetworkOk {
-                println!("[+] 网络正常。");
-                state = RuntimeState::NetworkOk;
-            }
-        } else {
-            if state != RuntimeState::NetworkUnavailable
-                && state != RuntimeState::BalanceInsufficient
-            {
-                println!("[!] 网络不可用，正在尝试认证。");
-                state = RuntimeState::NetworkUnavailable;
-            }
+fn wifi_connection_missing() -> bool {
+    #[cfg(windows)]
+    {
+        wifi::current_campus_wifi().is_none()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
 
-            match login(
-                &config.username,
-                &config.password,
-                false,
-                config.wired_interface(),
-            ) {
-                Ok(PortalLoginOutcome::Verified) => {
-                    println!("[+] 认证成功，网络已恢复。");
-                    state = RuntimeState::NetworkOk;
-                    credentials_verified = true;
-                }
-                Ok(PortalLoginOutcome::Rejected) => {
-                    println!("[!] 认证失败，请重新输入账号密码。");
-                    state = prompt_until_verified(config, campus_wifi);
-                    credentials_verified = state == RuntimeState::NetworkOk;
-                }
-                Ok(PortalLoginOutcome::Inconclusive) => {
-                    if state != RuntimeState::AlreadyOnline {
-                        println!("[+] 当前设备已经在线，本轮无需重新认证。");
-                        state = RuntimeState::AlreadyOnline;
-                    }
-                }
-                Ok(PortalLoginOutcome::BalanceInsufficient) => {
-                    if state != RuntimeState::BalanceInsufficient {
-                        println!("[!] {}", balance_insufficient_tip(campus_wifi));
-                        state = RuntimeState::BalanceInsufficient;
-                    }
-                }
-                Err(err) => {
-                    if state != RuntimeState::NetworkUnavailable
-                        && state != RuntimeState::BalanceInsufficient
-                    {
-                        println!("[!] 认证异常: {err}");
-                    }
-                    state = RuntimeState::NetworkUnavailable;
-                }
-            }
+fn main() -> ExitCode {
+    configure_console();
+    let cli = Cli::parse();
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("[!] {error}");
+            ExitCode::from(2)
         }
+    }
+}
 
-        thread::sleep(Duration::from_secs(CHECK_INTERVAL_SECS));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn background_credentials_never_read_stdin() {
+        assert!(replacement_credentials(false).is_err());
+    }
+    #[test]
+    fn cli_supports_explicit_path_and_offline_validation() {
+        let cli = Cli::try_parse_from([
+            "whut",
+            "--config",
+            "selected.toml",
+            "--non-interactive",
+            "--check-config",
+        ])
+        .unwrap();
+        assert_eq!(cli.config, Some(PathBuf::from("selected.toml")));
+        assert!(cli.non_interactive && cli.check_config);
     }
 }

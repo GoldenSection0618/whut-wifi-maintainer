@@ -61,8 +61,6 @@ pub enum WiredBlocker {
     NotEnabled,
     /// 绑定接口上没有可用的默认路由。
     NoDefaultRoute,
-    /// 有默认路由但校园网认证门户探测失败。
-    PortalUnreachable,
 }
 
 #[cfg(not(windows))]
@@ -74,9 +72,6 @@ impl WiredBlocker {
             }
             WiredBlocker::NoDefaultRoute => {
                 "[*] 绑定接口暂无可用的 IPv4 默认路由，等待接入校园网。"
-            }
-            WiredBlocker::PortalUnreachable => {
-                "[*] 绑定接口已有默认路由，但无法访问校园网认证门户，等待接入 WHUT 校园网。"
             }
         }
     }
@@ -97,11 +92,7 @@ pub fn current_campus_wifi_detailed(
         return Err(WiredBlocker::NoDefaultRoute);
     }
 
-    if campus_portal_reachable(iface) {
-        Ok(CampusWifi::Wired)
-    } else {
-        Err(WiredBlocker::PortalUnreachable)
-    }
+    Ok(CampusWifi::Wired)
 }
 
 #[cfg(not(windows))]
@@ -136,44 +127,6 @@ fn has_default_route_on(content: &str, iface: &str) -> bool {
     })
 }
 
-#[cfg(not(windows))]
-fn campus_portal_reachable(iface: &str) -> bool {
-    // 检查所选接口上的门户可达性；HTTP token 本身不能证明服务器身份。
-    use std::time::Duration;
-
-    use crate::network::client_builder;
-    use crate::portal_auth::CSRF_TOKEN_URL;
-
-    let Ok(client) = client_builder(Some(iface))
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(3))
-        .build()
-    else {
-        return false;
-    };
-
-    client
-        .get(CSRF_TOKEN_URL)
-        .send()
-        .ok()
-        .filter(|resp| resp.status().is_success())
-        .and_then(|resp| resp.text().ok())
-        .is_some_and(|body| portal_response_has_csrf_token(&body))
-}
-
-// 门户响应必须包含非空 CSRF token；这只是可达性检查，不是身份认证。
-#[cfg(any(not(windows), test))]
-fn portal_response_has_csrf_token(body: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|json| {
-            json.get("csrf_token")
-                .and_then(serde_json::Value::as_str)
-                .map(|token| !token.trim().is_empty())
-        })
-        .unwrap_or(false)
-}
-
 pub fn balance_insufficient_tip(campus_wifi: CampusWifi) -> &'static str {
     match campus_wifi {
         CampusWifi::Dorm => {
@@ -191,7 +144,7 @@ pub fn balance_insufficient_tip(campus_wifi: CampusWifi) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{campus_wifi, has_default_route_on, portal_response_has_csrf_token};
+    use super::{campus_wifi, has_default_route_on};
 
     #[test]
     fn recognizes_campus_wifi_ssids() {
@@ -264,25 +217,5 @@ mod tests {
                 "eth0"
             ));
         }
-    }
-
-    #[test]
-    fn accepts_valid_csrf_token_response() {
-        assert!(portal_response_has_csrf_token(
-            r#"{"csrf_token":"jw_8-3wDi2wj4Ayi7bYYmGQXbtk="}"#
-        ));
-    }
-
-    #[test]
-    fn rejects_missing_or_empty_csrf_token() {
-        // 空 token 不可用，必须拒绝
-        assert!(!portal_response_has_csrf_token(r#"{"csrf_token":""}"#));
-        assert!(!portal_response_has_csrf_token(r#"{"csrf_token":"   "}"#));
-        assert!(!portal_response_has_csrf_token(r#"{"csrf_token":null}"#));
-        assert!(!portal_response_has_csrf_token(r#"{"csrf_token":42}"#));
-        // 字段缺失
-        assert!(!portal_response_has_csrf_token(r#"{"code":0}"#));
-        // 非法 JSON
-        assert!(!portal_response_has_csrf_token("not json"));
     }
 }

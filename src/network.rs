@@ -1,8 +1,97 @@
 use reqwest::blocking::{Client, ClientBuilder};
 
-use crate::USER_AGENT_VALUE;
+use crate::config::{Config, MonitorSettings};
+use crate::protocol::USER_AGENT;
+use std::io::Read;
+use std::time::Duration;
 
-const CONNECT_TEST_URL: &str = "http://www.msftconnecttest.com/connecttest.txt";
+#[derive(thiserror::Error, Debug)]
+pub enum RequestError {
+    #[error("请求超时")]
+    Timeout,
+    #[error("连接或传输失败")]
+    Transport,
+    #[error("服务器返回 HTTP {0}")]
+    Status(u16),
+    #[error("服务器响应格式异常")]
+    Protocol,
+}
+
+impl From<reqwest::Error> for RequestError {
+    fn from(error: reqwest::Error) -> Self {
+        // reqwest errors may contain URLs with authentication tokens.
+        if error.is_timeout() {
+            Self::Timeout
+        } else if let Some(status) = error.status() {
+            Self::Status(status.as_u16())
+        } else if error.is_decode() {
+            Self::Protocol
+        } else {
+            Self::Transport
+        }
+    }
+}
+
+pub struct HttpClients {
+    pub probe: Client,
+    pub portal: Client,
+    pub discovery: Client,
+    pub unified: Client,
+}
+
+impl HttpClients {
+    pub fn new(config: &Config) -> Result<Self, RequestError> {
+        let make = || {
+            client_builder(config.wired_interface())
+                .timeout(Duration::from_secs(config.monitor.timeout_secs))
+                .user_agent(USER_AGENT)
+        };
+        Ok(Self {
+            probe: make().redirect(reqwest::redirect::Policy::none()).build()?,
+            portal: make()
+                .cookie_store(true)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
+            discovery: make()
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .build()?,
+            unified: make()
+                .cookie_store(true)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reachability {
+    Online,
+    Partial,
+    Offline,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeFailure {
+    Timeout,
+    Transport,
+    Status,
+    UnexpectedBody,
+}
+
+pub struct ProbeReport {
+    pub http: Result<(), ProbeFailure>,
+    pub https: Result<(), ProbeFailure>,
+}
+
+impl ProbeReport {
+    pub fn reachability(&self) -> Reachability {
+        match (self.http.is_ok(), self.https.is_ok()) {
+            (true, true) => Reachability::Online,
+            (false, false) => Reachability::Offline,
+            _ => Reachability::Partial,
+        }
+    }
+}
 
 pub fn client_builder(wired_interface: Option<&str>) -> ClientBuilder {
     let builder = Client::builder();
@@ -17,23 +106,121 @@ pub fn client_builder(wired_interface: Option<&str>) -> ClientBuilder {
     builder
 }
 
-pub fn is_network_ok(wired_interface: Option<&str>) -> bool {
-    let client = match client_builder(wired_interface)
-        .timeout(std::time::Duration::from_secs(5))
-        .user_agent(USER_AGENT_VALUE)
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return false,
-    };
+pub fn probe(client: &Client, settings: &MonitorSettings) -> ProbeReport {
+    ProbeReport {
+        http: probe_one(
+            client,
+            &settings.http_url,
+            Some(&settings.http_expected_body),
+        ),
+        https: probe_one(client, &settings.https_url, None),
+    }
+}
 
-    // 仅 HTTP 成功还不够；被认证页劫持时，响应内容会不同。
-    match client.get(CONNECT_TEST_URL).send() {
-        Ok(resp) if resp.status().is_success() => match resp.text() {
-            Ok(text) => text.trim() == "Microsoft Connect Test",
-            Err(_) => false,
-        },
-        _ => false,
+fn probe_one(client: &Client, url: &str, expected: Option<&str>) -> Result<(), ProbeFailure> {
+    let response = client.get(url).send().map_err(|error| {
+        if error.is_timeout() {
+            ProbeFailure::Timeout
+        } else {
+            ProbeFailure::Transport
+        }
+    })?;
+    if !response.status().is_success() {
+        return Err(ProbeFailure::Status);
+    }
+    // Bound reads even when a captive portal returns a large response.
+    let limit = if expected.is_some() { 65537 } else { 4096 };
+    let mut body = Vec::new();
+    response
+        .take(limit)
+        .read_to_end(&mut body)
+        .map_err(|_| ProbeFailure::Transport)?;
+    let valid = match expected {
+        Some(value) => std::str::from_utf8(&body).is_ok_and(|body| body.trim() == value.trim()),
+        None => body.iter().any(|byte| !byte.is_ascii_whitespace()),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(ProbeFailure::UnexpectedBody)
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use crate::test_support::{response, serve};
+
+    fn client() -> Client {
+        Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn single_probe_failure_is_partial_not_offline() {
+        let (url, server) = serve(vec![
+            response("503 Service Unavailable", ""),
+            response("200 OK", "public page"),
+        ]);
+        // Loopback HTTP tests status/body handling; configuration enforces HTTPS in production.
+        let settings = MonitorSettings {
+            http_url: url.clone(),
+            https_url: url,
+            ..Default::default()
+        };
+        let report = probe(&client(), &settings);
+        assert_eq!(report.reachability(), Reachability::Partial);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn captive_portal_and_redirect_do_not_pass_probes() {
+        let (url, server) = serve(vec![
+            response("200 OK", "<html>login</html>"),
+            response("302 Found", "redirect"),
+        ]);
+        let settings = MonitorSettings {
+            http_url: url.clone(),
+            https_url: url,
+            ..Default::default()
+        };
+        assert_eq!(
+            probe(&client(), &settings).reachability(),
+            Reachability::Offline
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn both_expected_responses_are_required_for_online() {
+        let (url, server) = serve(vec![
+            response("200 OK", "Microsoft Connect Test"),
+            response("200 OK", "public page"),
+        ]);
+        let settings = MonitorSettings {
+            http_url: url.clone(),
+            https_url: url,
+            ..Default::default()
+        };
+        assert_eq!(
+            probe(&client(), &settings).reachability(),
+            Reachability::Online
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn empty_https_response_does_not_pass() {
+        let (url, server) = serve(vec![response("200 OK", "  \r\n")]);
+        assert_eq!(
+            probe_one(&client(), &url, None),
+            Err(ProbeFailure::UnexpectedBody)
+        );
+        server.join().unwrap();
     }
 }
 
