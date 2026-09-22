@@ -5,10 +5,10 @@ use std::error::Error;
 use std::time::Duration;
 
 use crate::USER_AGENT_VALUE;
-use crate::network::is_network_ok;
+use crate::network::{client_builder, is_network_ok};
 
 const REDIRECT_URL: &str = "http://www.msftconnecttest.com/redirect";
-const CSRF_TOKEN_URL: &str = "http://172.30.21.100/api/csrf-token";
+pub(crate) const CSRF_TOKEN_URL: &str = "http://172.30.21.100/api/csrf-token";
 const LOGIN_URL: &str = "http://172.30.21.100/api/account/login";
 
 struct AuthContext {
@@ -24,8 +24,8 @@ pub enum PortalLoginOutcome {
     BalanceInsufficient,
 }
 
-fn build_client() -> Result<Client, Box<dyn Error>> {
-    Ok(Client::builder()
+fn build_client(wired_interface: Option<&str>) -> Result<Client, Box<dyn Error>> {
+    Ok(client_builder(wired_interface)
         .cookie_store(true)
         .user_agent(USER_AGENT_VALUE)
         .build()?)
@@ -96,8 +96,9 @@ pub fn login(
     username: &str,
     password: &str,
     verbose: bool,
+    wired_interface: Option<&str>,
 ) -> Result<PortalLoginOutcome, Box<dyn Error>> {
-    let client = build_client()?;
+    let client = build_client(wired_interface)?;
     let auth_context = auth_context(&client, verbose);
 
     let csrf_json: Value = client
@@ -150,7 +151,7 @@ pub fn login(
     if result.get("code").and_then(Value::as_i64) == Some(0)
         || result.get("msg").and_then(Value::as_str) == Some("success")
     {
-        if !auth_context.from_redirect && is_network_ok() {
+        if !auth_context.from_redirect && is_network_ok(wired_interface) {
             Ok(PortalLoginOutcome::Inconclusive)
         } else {
             if verbose {

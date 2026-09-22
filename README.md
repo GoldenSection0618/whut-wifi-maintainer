@@ -13,3 +13,50 @@
 可你回到寝室之后，却发现电脑意外断网，任务已经中止甚至失败，一切又得重来……这是本仓库希望能解决的问题。
 
 本仓库提供一个程序，能够检测电脑上是否已经断开网络，并在断网的第一时间重新认证，快速重连。
+
+## 使用方法
+
+### Windows
+
+1. 从 Releases 下载或在本地执行 `cargo build --release` 编译；
+2. 运行 `whut-wifi-maintainer.exe`（或双击 `run.cmd`），首次运行会提示输入校园网账号密码；
+3. 账号密码会保存到程序同目录的 `config.toml`，之后自动读取。
+
+### Linux / OpenWrt（有线接入支持）
+
+面向路由器等通过网线接入校园网的设备，适合 7×24 小时常驻保活。
+
+有线模式需要**显式开启并绑定校园网 WAN 接口**：程序先检查该接口上的 IPv4 默认路由，再通过该接口探测认证门户的 CSRF 接口，两者都通过后才开始保活。门户探测、连通性检查和认证请求都会绑定该接口，并禁用 HTTP/HTTPS 环境代理；绑定失败时不会自动改走其他接口。Linux 的接口绑定可能需要 root 或相应网络权限，OpenWrt 可使用 root 运行。
+
+HTTP 门户及 CSRF token **不能证明服务器身份**。请仅在确定所选接口接入可信校园网时开启有线模式，不要为家庭网络或备用出口启用此设置。
+
+交叉编译静态二进制（以 aarch64 路由器为例，需要另外准备目标平台的 musl C 编译器 / 链接器，安装 Rust target 并不会安装它们）：
+
+```sh
+rustup target add aarch64-unknown-linux-musl
+cargo build --release --target aarch64-unknown-linux-musl
+# 产物：target/aarch64-unknown-linux-musl/release/whut-wifi-maintainer
+```
+
+在路由器上运行：
+
+```sh
+mkdir -p /root/whut-wifi-maintainer
+# 将编译产物和 config.toml 放入该目录
+cd /root/whut-wifi-maintainer && ./whut-wifi-maintainer
+```
+
+配置文件（`config.toml`，与程序同目录）：
+
+```toml
+username = "你的学号"
+password = "你的密码"
+wired = true
+wired_interface = "eth0"  # 绑定 WAN 口接口名，按实际情况填写（如 eth0.2、pppoe-wan）
+```
+
+配置文件包含明文账号密码。Unix 下程序在读取配置正文前，会通过文件句柄将已有文件收紧为 `0600`；调整失败会明确报错退出，不等待网络或凭据验证。创建、覆盖文件时同样保持 `0600`。手工创建配置也请执行 `chmod 600 config.toml`，从创建时就确保仅所有者可读写。
+
+Linux/OpenWrt 首次运行前必须手工准备上述完整的 `config.toml`；缺少账号密码、格式错误、未开启有线模式或接口名无效时，程序会报告错误并立即退出。接口名必须非空、少于 16 字节，且不能包含空白、斜线或空字符。配置在启动时读取，修改配置后请重启程序。终端中重新输入账号密码会保留有线模式和接口设置。后台常驻 / 开机自启时无法交互输入，请先修正配置再重启。
+
+每轮检查后程序等待 30 秒，并通过 `http://www.msftconnecttest.com/connecttest.txt` 的预期内容判断连通性。检测到断网后会尝试重新认证；实际恢复时间取决于门户响应、请求超时及账号状态。

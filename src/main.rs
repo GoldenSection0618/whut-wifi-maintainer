@@ -4,22 +4,41 @@ mod portal_auth;
 mod unified_auth;
 mod wifi;
 
-use config::{Config, load_or_prompt_config, prompt_config, save_config};
+#[cfg(windows)]
+use config::load_or_prompt_config;
+use config::{Config, prompt_config, save_config};
 use network::is_network_ok;
 use portal_auth::{PortalLoginOutcome, login};
+use std::io::IsTerminal;
 use std::thread;
 use std::time::Duration;
 use unified_auth::{CredentialVerification, verify_credentials};
-use wifi::{CampusWifi, balance_insufficient_tip, current_campus_wifi, initialize_windows_runtime};
+#[cfg(windows)]
+use wifi::current_campus_wifi;
+#[cfg(not(windows))]
+use wifi::current_campus_wifi_detailed;
+use wifi::{CampusWifi, balance_insufficient_tip, initialize_windows_runtime};
 
 const CHECK_INTERVAL_SECS: u64 = 30;
 const CAMPUS_CHECK_INTERVAL_SECS: u64 = 10;
 pub(crate) const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+#[cfg(windows)]
+const OUTSIDE_CAMPUS_MESSAGE: &str =
+    "[*] 当前未接入校园 Wi-Fi，等待连接 WHUT-WLAN、WHUT-DORM 或 WHUT-ISP。";
+
+// 等待间隔只应用于非交互 stdin（如路由器后台运行），
+// 交互终端用户应能立即重新输入。
+fn sleep_if_non_interactive() {
+    if !std::io::stdin().is_terminal() {
+        thread::sleep(Duration::from_secs(CAMPUS_CHECK_INTERVAL_SECS));
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RuntimeState {
     Unknown,
-    OutsideCampus,
+    OutsideCampus(&'static str),
     NetworkOk,
     NetworkUnavailable,
     AlreadyOnline,
@@ -40,14 +59,20 @@ fn configure_console() {}
 fn prompt_until_verified(config: &mut Config, campus_wifi: CampusWifi) -> RuntimeState {
     loop {
         match prompt_config() {
-            Ok(new_config) => *config = new_config,
+            Ok(new_config) => config.update_credentials(new_config),
             Err(err) => {
                 println!("[!] 未更新账号密码: {err}");
+                sleep_if_non_interactive();
                 continue;
             }
         }
 
-        match login(&config.username, &config.password, true) {
+        match login(
+            &config.username,
+            &config.password,
+            true,
+            config.wired_interface(),
+        ) {
             Ok(PortalLoginOutcome::Verified) => {
                 if let Err(err) = save_config(config) {
                     println!("[!] 账号密码可用，但保存失败: {err}");
@@ -78,32 +103,50 @@ fn main() {
     configure_console();
     initialize_windows_runtime();
 
+    #[cfg(windows)]
     let mut config = None;
+    #[cfg(not(windows))]
+    let mut config = config::load_wired_config().unwrap_or_else(|error| {
+        eprintln!("[!] {error}");
+        std::process::exit(1);
+    });
     let mut credentials_verified = false;
     let mut state = RuntimeState::Unknown;
 
     println!("WHUT WiFi 保持器已启动。");
 
     loop {
-        // 不在目标校园 Wi-Fi 时不读取配置，也不发起认证请求。
-        let Some(campus_wifi) = current_campus_wifi() else {
-            if state != RuntimeState::OutsideCampus {
-                println!("[*] 当前未接入校园 Wi-Fi，等待连接 WHUT-WLAN、WHUT-DORM 或 WHUT-ISP。");
-                state = RuntimeState::OutsideCampus;
+        // Windows 先检查 SSID；Linux 先读取显式有线配置。
+        // 网络检测通过前不发起认证请求。
+        #[cfg(windows)]
+        let (campus_wifi, outside_message) = (current_campus_wifi(), OUTSIDE_CAMPUS_MESSAGE);
+        #[cfg(not(windows))]
+        let (campus_wifi, outside_message) = match current_campus_wifi_detailed(&config) {
+            Ok(wifi) => (Some(wifi), ""),
+            Err(reason) => (None, reason.message()),
+        };
+
+        let Some(campus_wifi) = campus_wifi else {
+            if state != RuntimeState::OutsideCampus(outside_message) {
+                println!("{outside_message}");
+                state = RuntimeState::OutsideCampus(outside_message);
             }
 
             thread::sleep(Duration::from_secs(CAMPUS_CHECK_INTERVAL_SECS));
             continue;
         };
 
+        #[cfg(windows)]
         let config = config.get_or_insert_with(load_or_prompt_config);
-        let network_ok = is_network_ok();
+        #[cfg(not(windows))]
+        let config = &mut config;
+        let network_ok = is_network_ok(config.wired_interface());
 
         // 每次进程启动后只在已有网络时校验一次统一认证凭据。
         if !credentials_verified && network_ok {
             println!("[*] 当前网络已连接，正在通过统一认证校验账号密码...");
 
-            match verify_credentials(&config.username, &config.password) {
+            match verify_credentials(&config.username, &config.password, config.wired_interface()) {
                 Ok(CredentialVerification::Valid) => {
                     if let Err(err) = save_config(config) {
                         println!("[!] 账号密码校验成功，但保存失败: {err}");
@@ -114,8 +157,11 @@ fn main() {
                 Ok(CredentialVerification::Invalid) => {
                     println!("[!] 账号密码校验失败，请重新输入。");
                     match prompt_config() {
-                        Ok(new_config) => *config = new_config,
-                        Err(err) => println!("[!] 未更新账号密码: {err}"),
+                        Ok(new_config) => config.update_credentials(new_config),
+                        Err(err) => {
+                            println!("[!] 未更新账号密码: {err}");
+                            sleep_if_non_interactive();
+                        }
                     }
                     continue;
                 }
@@ -146,7 +192,12 @@ fn main() {
                 state = RuntimeState::NetworkUnavailable;
             }
 
-            match login(&config.username, &config.password, false) {
+            match login(
+                &config.username,
+                &config.password,
+                false,
+                config.wired_interface(),
+            ) {
                 Ok(PortalLoginOutcome::Verified) => {
                     println!("[+] 认证成功，网络已恢复。");
                     state = RuntimeState::NetworkOk;
