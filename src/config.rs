@@ -102,9 +102,11 @@ impl Config {
             && !self.wired_interface().is_some_and(|name| {
                 !name.is_empty()
                     && name.len() < 16
+                    && name != "."
+                    && name != ".."
                     && !name
                         .chars()
-                        .any(|c| c.is_whitespace() || c == '/' || c == '\0')
+                        .any(|c| c.is_whitespace() || c == '/' || c == ':' || c == '\0')
             })
         {
             return Err(ConfigError::Invalid("有线模式需要有效的 wired_interface"));

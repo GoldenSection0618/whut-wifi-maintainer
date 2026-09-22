@@ -127,6 +127,7 @@ def main() -> None:
         run("./scripts/feeds", "install", "rust", cwd=sdk)
     run("./scripts/feeds", "install", "ca-bundle", cwd=sdk)
     config_path = sdk / ".config"
+    reject_symlinks(config_path)
     config = config_path.read_text() if config_path.exists() else ""
     names = ("ALL", "ALL_KMODS", "ALL_NONSHARED", f"PACKAGE_{PACKAGE}")
     config = "\n".join(line for line in config.splitlines()
