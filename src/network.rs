@@ -36,16 +36,11 @@ pub struct HttpClients {
     pub probe: Client,
     pub portal: Client,
     pub discovery: Client,
-    pub unified: Client,
 }
 
 impl HttpClients {
     pub fn new(config: &Config) -> Result<Self, RequestError> {
-        let make = || {
-            client_builder(config.wired_interface())
-                .timeout(Duration::from_secs(config.monitor.timeout_secs))
-                .user_agent(USER_AGENT)
-        };
+        let make = || configured_builder(config);
         Ok(Self {
             probe: make().redirect(reqwest::redirect::Policy::none()).build()?,
             portal: make()
@@ -55,12 +50,22 @@ impl HttpClients {
             discovery: make()
                 .redirect(reqwest::redirect::Policy::limited(5))
                 .build()?,
-            unified: make()
-                .cookie_store(true)
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
         })
     }
+}
+
+fn configured_builder(config: &Config) -> ClientBuilder {
+    client_builder(config.wired_interface())
+        .timeout(Duration::from_secs(config.monitor.timeout_secs))
+        .user_agent(USER_AGENT)
+}
+
+pub fn credential_session(config: &Config) -> Result<Client, RequestError> {
+    // Each credential check must prove the supplied password, not reuse a prior SSO login.
+    Ok(configured_builder(config)
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,7 +139,21 @@ fn probe_one(client: &Client, url: &str, expected: Option<&str>) -> Result<(), P
     response
         .take(limit)
         .read_to_end(&mut body)
-        .map_err(|_| ProbeFailure::Transport)?;
+        .map_err(|error| {
+            let timeout = error.kind() == std::io::ErrorKind::TimedOut
+                || error
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<reqwest::Error>())
+                    .is_some_and(|error| error.is_timeout());
+            if timeout {
+                ProbeFailure::Timeout
+            } else {
+                ProbeFailure::Transport
+            }
+        })?;
+    if expected.is_some() && body.len() > 65536 {
+        return Err(ProbeFailure::UnexpectedBody);
+    }
     let valid = match expected {
         Some(value) => std::str::from_utf8(&body).is_ok_and(|body| body.trim() == value.trim()),
         None => body.iter().any(|byte| !byte.is_ascii_whitespace()),
@@ -150,6 +169,71 @@ fn probe_one(client: &Client, url: &str, expected: Option<&str>) -> Result<(), P
 mod probe_tests {
     use super::*;
     use crate::test_support::{response, serve};
+
+    #[test]
+    fn independent_credential_checks_do_not_reuse_sso_cookies() {
+        let cookie_response = "HTTP/1.1 200 OK\r\nSet-Cookie: TGC=old-session; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned();
+        let (url, server) = serve(vec![
+            cookie_response,
+            response("200 OK", ""),
+            response("200 OK", ""),
+        ]);
+        let config: Config =
+            toml::from_str("username='test'\npassword='secret'\nwired=true\nwired_interface='lo'")
+                .unwrap();
+        let first = credential_session(&config).unwrap();
+        first.get(&url).send().unwrap();
+        first.get(&url).send().unwrap();
+        credential_session(&config)
+            .unwrap()
+            .get(&url)
+            .send()
+            .unwrap();
+        let requests = server.join().unwrap();
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("cookie: tgc=old-session")
+        );
+        assert!(!requests[2].to_ascii_lowercase().contains("cookie:"));
+    }
+
+    #[test]
+    fn rejects_http_response_truncated_after_expected_text() {
+        let mut body = String::from("expected");
+        body.extend(std::iter::repeat_n(' ', 65537));
+        body.push_str("unexpected suffix");
+        let (url, server) = serve(vec![response("200 OK", &body)]);
+        assert_eq!(
+            probe_one(&client(), &url, Some("expected")),
+            Err(ProbeFailure::UnexpectedBody)
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn response_body_timeout_is_reported_as_timeout() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        assert_eq!(
+            probe_one(&client, &url, Some("expected")),
+            Err(ProbeFailure::Timeout)
+        );
+        server.join().unwrap();
+    }
 
     fn client() -> Client {
         Client::builder()

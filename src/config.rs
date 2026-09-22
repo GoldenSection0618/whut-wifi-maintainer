@@ -153,6 +153,12 @@ pub struct ConfigStore {
     path: PathBuf,
 }
 
+pub enum SaveOutcome {
+    Saved,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    DurabilityUnconfirmed(io::Error),
+}
+
 impl ConfigStore {
     pub fn resolve(explicit: Option<PathBuf>) -> Result<Self, ConfigError> {
         let executable = std::env::current_exe()?;
@@ -196,11 +202,10 @@ impl ConfigStore {
         Ok(config)
     }
 
-    pub fn save(&self, config: &Config) -> Result<(), ConfigError> {
+    pub fn save(&self, config: &Config) -> Result<SaveOutcome, ConfigError> {
         config.validate()?;
         let content = toml::to_string(config).map_err(|_| ConfigError::Serialize)?;
-        atomic_write(&self.path, &content, |file| file.sync_all())?;
-        Ok(())
+        Ok(atomic_write(&self.path, &content, |file| file.sync_all())?)
     }
 }
 
@@ -208,11 +213,24 @@ fn atomic_write(
     path: &Path,
     content: &str,
     sync: impl FnOnce(&fs::File) -> io::Result<()>,
-) -> io::Result<()> {
+) -> io::Result<SaveOutcome> {
+    atomic_write_with_sync(path, content, sync, |directory| directory.sync_all())
+}
+
+fn atomic_write_with_sync(
+    path: &Path,
+    content: &str,
+    sync: impl FnOnce(&fs::File) -> io::Result<()>,
+    sync_directory: impl FnOnce(&fs::File) -> io::Result<()>,
+) -> io::Result<SaveOutcome> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
+    #[cfg(unix)]
+    let directory = fs::File::open(parent)?;
+    #[cfg(not(unix))]
+    let _ = sync_directory;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     #[cfg(unix)]
     {
@@ -225,13 +243,32 @@ fn atomic_write(
     sync(temporary.as_file())?;
     temporary.persist(path).map_err(|err| err.error)?;
     #[cfg(unix)]
-    fs::File::open(parent)?.sync_all()?;
-    Ok(())
+    if let Err(error) = sync_directory(&directory) {
+        return Ok(SaveOutcome::DurabilityUnconfirmed(error));
+    }
+    Ok(SaveOutcome::Saved)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_failure_reports_committed_but_not_confirmed_durable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "original").unwrap();
+        let outcome = atomic_write_with_sync(
+            &path,
+            "replacement",
+            |f| f.sync_all(),
+            |_| Err(io::Error::other("injected directory sync failure")),
+        )
+        .unwrap();
+        assert!(matches!(outcome, SaveOutcome::DurabilityUnconfirmed(_)));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
+    }
 
     fn sample() -> Config {
         toml::from_str("username='student'\npassword='old'\nwired=true\nwired_interface='wan'")

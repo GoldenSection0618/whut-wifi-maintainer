@@ -245,15 +245,19 @@ fn run(cli: Cli) -> Result<(), String> {
         // A temporary unified-auth failure must not suspend connectivity monitoring.
         if reachability == Reachability::Online && !verified && now >= next_verification {
             next_verification = now.saturating_add(interval.max(Duration::from_secs(30)));
-            match unified_auth::verify_credentials(
-                &clients.unified,
-                &config.username,
-                &config.password,
-            ) {
+            match network::credential_session(&config).and_then(|session| {
+                unified_auth::verify_credentials(&session, &config.username, &config.password)
+            }) {
                 Ok(CredentialVerification::Valid) => {
                     verified = true;
                     if pending_credentials {
-                        store.save(&config).map_err(|e| e.to_string())?;
+                        if let config::SaveOutcome::DurabilityUnconfirmed(error) =
+                            store.save(&config).map_err(|e| e.to_string())?
+                        {
+                            eprintln!(
+                                "[!] 新配置已替换，但目录同步失败，断电持久性未确认: {error}"
+                            );
+                        }
                         pending_credentials = false;
                         println!("[+] 新凭据已验证并保存。");
                     }
