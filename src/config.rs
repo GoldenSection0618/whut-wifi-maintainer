@@ -28,8 +28,8 @@ impl Config {
             .filter(|iface| {
                 !iface.is_empty()
                     && iface.len() < 16
-                    && iface != "."
-                    && iface != ".."
+                    && *iface != "."
+                    && *iface != ".."
                     && !iface
                         .chars()
                         .any(|c| c.is_whitespace() || c == '/' || c == ':' || c == '\0')
