@@ -10,7 +10,7 @@
 cd "$SDK"
 ./scripts/feeds update base packages
 cd "$SOURCE"
-python3 scripts/build_openwrt.py --sdk "$SDK" --output "$OUTPUT" --system-rust
+python3 scripts/build_openwrt.py --sdk "$SDK" --output "$OUTPUT" --package-release 1 --system-rust
 ```
 
 `SDK` 是已解压 SDK 的绝对路径，`SOURCE` 是源码仓库，`OUTPUT` 是产物目录。源码必须已提交且工作区干净，构建只使用该提交的跟踪文件。不会打包本地账号配置。
@@ -55,3 +55,5 @@ whut-wifi-maintainer --config /etc/whut-wifi-maintainer/config.toml --check-conf
 5. 验证外网、无线、原有应用、程序升级及回退、配置更改后的重启保留。
 
 设备私密迁移材料不应提交到源码仓库。旧固件拼接工具仅作为历史恢复资料保存，不参与标准安装与后续应用更新。
+
+构建必须显式指定正整数修订号（例如 `--package-release 2`），并使用不存在的新交付目录。旧交付不会被覆盖。程序 `--build-info` 离线输出版本、源码提交、目标架构及修订号；普通 Cargo 构建未提供可靠来源信息时显示 `unknown`。源码与软件包定义均来自同一固定提交的归档，SDK 中本包目录会安全重建，旧补丁不会残留。清单记录编译器、SDK、feeds 和 APK 内实际二进制哈希。

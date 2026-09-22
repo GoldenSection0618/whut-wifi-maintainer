@@ -52,5 +52,7 @@ jobs:
           tar --zstd -xf "$BUILD_ROOT/sdk.tar.zst" -C "$BUILD_ROOT/sdk" --strip-components=1
           cd "$BUILD_ROOT/sdk"
           ./scripts/feeds update base packages
+      - name: Test build isolation
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Build APK and manifest
-        run: python3 scripts/build_openwrt.py --sdk "${{ runner.temp }}/openwrt/sdk" --output "${{ runner.temp }}/openwrt/output" --system-rust
+        run: python3 scripts/build_openwrt.py --sdk "${{ runner.temp }}/openwrt/sdk" --output "${{ runner.temp }}/openwrt/output" --system-rust --package-release 1

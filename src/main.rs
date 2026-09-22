@@ -31,6 +31,9 @@ struct Cli {
     /// 只校验配置，不联网、不改写正文；Unix 收紧权限为 0600。
     #[arg(long)]
     check_config: bool,
+    /// 显示版本、源码提交、目标架构和软件包修订号，然后退出。
+    #[arg(long)]
+    build_info: bool,
 }
 
 #[cfg(windows)]
@@ -120,6 +123,16 @@ fn validate_platform(config: &Config) -> Result<(), String> {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+    if cli.build_info {
+        println!(
+            "version={}\nsource_commit={}\ntarget={}\npackage_release={}",
+            env!("CARGO_PKG_VERSION"),
+            env!("WHUT_BUILD_COMMIT"),
+            env!("WHUT_BUILD_TARGET"),
+            env!("WHUT_PACKAGE_RELEASE")
+        );
+        return Ok(());
+    }
     if !cli.check_config {
         wifi::initialize_windows_runtime();
     }

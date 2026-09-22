@@ -5,6 +5,22 @@ fn binary() -> Command {
 }
 
 #[test]
+fn build_information_needs_no_configuration_or_network() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = binary()
+        .current_dir(directory.path())
+        .arg("--build-info")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let info = String::from_utf8(output.stdout).unwrap();
+    for field in ["version=", "source_commit=", "target=", "package_release="] {
+        assert!(info.contains(field));
+    }
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn validation_is_offline_and_does_not_rewrite_configuration() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("selected.toml");

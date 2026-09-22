@@ -5,8 +5,8 @@ include $(CURDIR)/source.mk
 
 PKG_NAME:=whut-wifi-maintainer
 PKG_VERSION:=$(WHUT_VERSION)
-PKG_RELEASE:=1
-PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
+PKG_RELEASE:=$(WHUT_RELEASE)
+PKG_SOURCE:=$(WHUT_SOURCE_ARCHIVE)
 PKG_HASH:=$(WHUT_SOURCE_SHA256)
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
@@ -18,6 +18,9 @@ endif
 
 include $(INCLUDE_DIR)/package.mk
 include $(TOPDIR)/feeds/packages/lang/rust/rust-package.mk
+CARGO_PKG_VARS += WHUT_BUILD_COMMIT=$(WHUT_SOURCE_COMMIT) WHUT_PACKAGE_RELEASE=$(WHUT_RELEASE)
+WHUT_RUST_BIN ?= $(STAGING_DIR)/host/bin
+CARGO_PKG_VARS += PATH="$(WHUT_RUST_BIN):$(PATH)" RUSTC="$(WHUT_RUST_BIN)/rustc"
 
 define Package/whut-wifi-maintainer
   SECTION:=net
