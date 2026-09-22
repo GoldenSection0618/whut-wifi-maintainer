@@ -7,10 +7,15 @@ mod wifi;
 use config::{Config, load_or_prompt_config, prompt_config, save_config};
 use network::is_network_ok;
 use portal_auth::{PortalLoginOutcome, login};
+use std::io::IsTerminal;
 use std::thread;
 use std::time::Duration;
 use unified_auth::{CredentialVerification, verify_credentials};
-use wifi::{CampusWifi, balance_insufficient_tip, current_campus_wifi, initialize_windows_runtime};
+#[cfg(windows)]
+use wifi::current_campus_wifi;
+#[cfg(not(windows))]
+use wifi::current_campus_wifi_detailed;
+use wifi::{CampusWifi, balance_insufficient_tip, initialize_windows_runtime};
 
 const CHECK_INTERVAL_SECS: u64 = 30;
 const CAMPUS_CHECK_INTERVAL_SECS: u64 = 10;
@@ -19,19 +24,12 @@ pub(crate) const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; 
 #[cfg(windows)]
 const OUTSIDE_CAMPUS_MESSAGE: &str =
     "[*] 当前未接入校园 Wi-Fi，等待连接 WHUT-WLAN、WHUT-DORM 或 WHUT-ISP。";
-#[cfg(not(windows))]
-const NO_DEFAULT_ROUTE_MESSAGE: &str = "[*] 当前未接入校园网（WAN 无默认路由），等待接入 WHUT-WLAN、WHUT-DORM、WHUT-ISP 或校园网有线口。";
-#[cfg(not(windows))]
-const PORTAL_UNREACHABLE_MESSAGE: &str =
-    "[*] WAN 已有默认路由，但无法访问校园网认证门户，等待接入 WHUT 校园网。";
 
-// 提示语与实际判断保持一致：无默认路由与门户不可达是两种不同的等待原因。
-#[cfg(not(windows))]
-fn outside_campus_message() -> &'static str {
-    if wifi::has_default_route() {
-        PORTAL_UNREACHABLE_MESSAGE
-    } else {
-        NO_DEFAULT_ROUTE_MESSAGE
+// 等待间隔只应用于非交互 stdin（如路由器后台运行），
+// 交互终端用户应能立即重新输入。
+fn sleep_if_non_interactive() {
+    if !std::io::stdin().is_terminal() {
+        thread::sleep(Duration::from_secs(CAMPUS_CHECK_INTERVAL_SECS));
     }
 }
 
@@ -62,8 +60,7 @@ fn prompt_until_verified(config: &mut Config, campus_wifi: CampusWifi) -> Runtim
             Ok(new_config) => *config = new_config,
             Err(err) => {
                 println!("[!] 未更新账号密码: {err}");
-                // 无交互终端（如路由器后台运行）时避免空转刷屏。
-                thread::sleep(Duration::from_secs(CAMPUS_CHECK_INTERVAL_SECS));
+                sleep_if_non_interactive();
                 continue;
             }
         }
@@ -106,14 +103,18 @@ fn main() {
     println!("WHUT WiFi 保持器已启动。");
 
     loop {
-        // 不在目标校园 Wi-Fi 时不读取配置，也不发起认证请求。
-        let Some(campus_wifi) = current_campus_wifi() else {
+        // 不在目标校园网时不读取配置，也不发起认证请求。
+        #[cfg(windows)]
+        let (campus_wifi, outside_message) = (current_campus_wifi(), OUTSIDE_CAMPUS_MESSAGE);
+        #[cfg(not(windows))]
+        let (campus_wifi, outside_message) = match current_campus_wifi_detailed() {
+            Ok(wifi) => (Some(wifi), ""),
+            Err(reason) => (None, reason.message()),
+        };
+
+        let Some(campus_wifi) = campus_wifi else {
             if state != RuntimeState::OutsideCampus {
-                #[cfg(windows)]
-                let message = OUTSIDE_CAMPUS_MESSAGE;
-                #[cfg(not(windows))]
-                let message = outside_campus_message();
-                println!("{message}");
+                println!("{outside_message}");
                 state = RuntimeState::OutsideCampus;
             }
 
@@ -142,8 +143,7 @@ fn main() {
                         Ok(new_config) => *config = new_config,
                         Err(err) => {
                             println!("[!] 未更新账号密码: {err}");
-                            // 无交互终端时避免空转刷屏。
-                            thread::sleep(Duration::from_secs(CAMPUS_CHECK_INTERVAL_SECS));
+                            sleep_if_non_interactive();
                         }
                     }
                     continue;
