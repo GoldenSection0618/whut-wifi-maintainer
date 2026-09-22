@@ -12,6 +12,7 @@ use std::error::Error;
 use std::time::Duration;
 
 use crate::USER_AGENT_VALUE;
+use crate::network::client_builder;
 
 const UNIFIED_LOGIN_URL: &str =
     "https://zhlgd.whut.edu.cn/tpass/login?service=https%3A%2F%2Fzhlgd.whut.edu.cn%2Ftp_up%2F";
@@ -30,8 +31,8 @@ pub enum CredentialVerification {
     Inconclusive,
 }
 
-fn build_client() -> Result<Client, Box<dyn Error>> {
-    Ok(Client::builder()
+fn build_client(wired_interface: Option<&str>) -> Result<Client, Box<dyn Error>> {
+    Ok(client_builder(wired_interface)
         .cookie_store(true)
         // 成功与否由登录接口的重定向目标判定，不能自动跟随。
         .redirect(Policy::none())
@@ -78,8 +79,9 @@ fn encrypt(public_key: &RsaPublicKey, value: &str) -> Result<String, Box<dyn Err
 pub fn verify_credentials(
     username: &str,
     password: &str,
+    wired_interface: Option<&str>,
 ) -> Result<CredentialVerification, Box<dyn Error>> {
-    let client = build_client()?;
+    let client = build_client(wired_interface)?;
 
     // 登录页会建立会话 Cookie，并提供本次提交所需的 lt。
     let login_page = client

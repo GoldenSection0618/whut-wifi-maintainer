@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct Config {
     pub username: String,
     pub password: String,
@@ -16,6 +16,20 @@ pub struct Config {
     /// 有线模式绑定的接口名（如 eth0、eth0.2、pppoe-wan）。
     #[serde(default)]
     pub wired_interface: Option<String>,
+}
+
+impl Config {
+    pub fn wired_interface(&self) -> Option<&str> {
+        self.wired
+            .then_some(self.wired_interface.as_deref())
+            .flatten()
+            .filter(|iface| !iface.trim().is_empty())
+    }
+
+    pub fn update_credentials(&mut self, credentials: Config) {
+        self.username = credentials.username;
+        self.password = credentials.password;
+    }
 }
 
 fn config_path() -> PathBuf {
@@ -79,17 +93,7 @@ pub fn prompt_config() -> Result<Config, Box<dyn Error>> {
 
 pub fn save_config(config: &Config) -> Result<(), Box<dyn Error>> {
     let path = config_path();
-    let mut content = format!(
-        "username = {:?}\npassword = {:?}\n",
-        config.username, config.password
-    );
-    // 保留有线模式设置，避免交互重输后丢失。
-    if config.wired {
-        content.push_str("wired = true\n");
-        if let Some(iface) = &config.wired_interface {
-            content.push_str(&format!("wired_interface = {iface:?}\n"));
-        }
-    }
+    let content = toml::to_string(config)?;
 
     write_config_file(&path, &content)?;
     println!("[*] 账号密码已保存到: {}", path.display());
@@ -102,14 +106,16 @@ fn write_config_file(path: &std::path::Path, content: &str) -> io::Result<()> {
 
     // 配置含明文账号密码：创建时即限制为仅所有者可读写，
     // 已存在的文件也一并收紧权限。
-    fs::OpenOptions::new()
+    let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        .truncate(false)
         .mode(0o600)
-        .open(path)
-        .and_then(|mut file| file.write_all(content.as_bytes()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .open(path)?;
+    // mode 只约束新文件；已有文件必须先通过句柄收紧权限，再写入凭据。
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.set_len(0)?;
+    file.write_all(content.as_bytes())
 }
 
 #[cfg(not(unix))]
@@ -117,10 +123,19 @@ fn write_config_file(path: &std::path::Path, content: &str) -> io::Result<()> {
     fs::write(path, content)
 }
 
-/// 静默读取配置（不提示输入），供 Linux 有线模式检测使用。
+/// 有线模式必须预先配置；保留具体错误，避免将无效配置误报为未启用。
 #[cfg(not(windows))]
-pub fn try_load_config() -> Option<Config> {
-    load_config().ok().flatten().map(|(config, _)| config)
+pub fn load_wired_config() -> Config {
+    match load_config() {
+        Ok(Some((config, path))) => {
+            println!("[*] 已读取本地配置: {}", path.display());
+            config
+        }
+        Ok(None) => exit_after_config_error(
+            "请先在 config.toml 中填写账号密码，并设置 wired = true 和 wired_interface。".into(),
+        ),
+        Err(err) => exit_after_config_error(err),
+    }
 }
 
 fn exit_after_config_error(err: Box<dyn Error>) -> ! {
@@ -130,6 +145,7 @@ fn exit_after_config_error(err: Box<dyn Error>) -> ! {
     std::process::exit(1);
 }
 
+#[cfg(windows)]
 pub fn load_or_prompt_config() -> Config {
     match load_config() {
         Ok(Some((config, path))) => {
@@ -141,5 +157,78 @@ pub fn load_or_prompt_config() -> Config {
             prompt_config().unwrap_or_else(|err| exit_after_config_error(err))
         }
         Err(err) => exit_after_config_error(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wired_config() -> Config {
+        toml::from_str(
+            "username = 'student'\npassword = 'old'\nwired = true\nwired_interface = 'wan'",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn wired_mode_requires_both_opt_in_and_interface() {
+        let mut config: Config =
+            toml::from_str("username = 'student'\npassword = 'password'").unwrap();
+        assert!(config.wired_interface().is_none());
+        config.wired_interface = Some("wan".into());
+        assert!(config.wired_interface().is_none());
+        config.wired = true;
+        assert_eq!(config.wired_interface(), Some("wan"));
+        config.wired_interface = Some(" \t".into());
+        assert!(config.wired_interface().is_none());
+        config.wired_interface = None;
+        assert!(config.wired_interface().is_none());
+    }
+
+    #[test]
+    fn credential_update_preserves_wired_settings_when_saved() {
+        let mut config = wired_config();
+        config.update_credentials(Config {
+            username: "new-student".into(),
+            // 包括 Rust Debug 转义与 TOML 转义不同的字符。
+            password: "new\0密码\t\"\\".into(),
+            wired: false,
+            wired_interface: None,
+        });
+        let saved = toml::to_string(&config).unwrap();
+        let loaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.username, "new-student");
+        assert_eq!(loaded.password, config.password);
+        assert_eq!(loaded.wired_interface(), Some("wan"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_file_is_private_when_created_and_rewritten() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "whut-config-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("config.toml");
+        write_config_file(&path, "initial-long-password").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        write_config_file(&path, "short").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "short");
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 }

@@ -59,7 +59,7 @@ pub fn current_campus_wifi() -> Option<CampusWifi> {
 pub enum WiredBlocker {
     /// 未在 config.toml 中显式开启有线模式并绑定接口。
     NotEnabled,
-    /// 绑定接口上没有默认路由（WAN 未获取地址）。
+    /// 绑定接口上没有可用的默认路由。
     NoDefaultRoute,
     /// 有默认路由但校园网认证门户探测失败。
     PortalUnreachable,
@@ -73,7 +73,7 @@ impl WiredBlocker {
                 "[*] 有线模式未开启：请在 config.toml 中设置 wired = true 并用 wired_interface 绑定 WAN 接口（如 eth0）后再启动。"
             }
             WiredBlocker::NoDefaultRoute => {
-                "[*] 绑定接口暂无默认路由（WAN 未获取地址），等待接入校园网。"
+                "[*] 绑定接口暂无可用的 IPv4 默认路由，等待接入校园网。"
             }
             WiredBlocker::PortalUnreachable => {
                 "[*] 绑定接口已有默认路由，但无法访问校园网认证门户，等待接入 WHUT 校园网。"
@@ -83,36 +83,25 @@ impl WiredBlocker {
 }
 
 #[cfg(not(windows))]
-pub fn current_campus_wifi_detailed() -> Result<CampusWifi, WiredBlocker> {
+pub fn current_campus_wifi_detailed(
+    config: &crate::config::Config,
+) -> Result<CampusWifi, WiredBlocker> {
     // 有线模式必须由用户显式开启并绑定指定接口：HTTP 门户返回 token
     // 并不能证明服务器身份，不能把"有默认路由 + 能访问某内网地址"
     // 当作已接入校园网的充分证据。
-    let Some(iface) = wired_interface() else {
+    let Some(iface) = config.wired_interface() else {
         return Err(WiredBlocker::NotEnabled);
     };
 
-    if !has_default_route_on_iface(&iface) {
+    if !has_default_route_on_iface(iface) {
         return Err(WiredBlocker::NoDefaultRoute);
     }
 
-    if campus_portal_reachable() {
+    if campus_portal_reachable(iface) {
         Ok(CampusWifi::Wired)
     } else {
         Err(WiredBlocker::PortalUnreachable)
     }
-}
-
-// 从配置中读取有线模式设置；未开启或未绑定接口时返回 None。
-#[cfg(not(windows))]
-fn wired_interface() -> Option<String> {
-    let config = crate::config::try_load_config()?;
-    if !config.wired {
-        return None;
-    }
-
-    config
-        .wired_interface
-        .filter(|iface| !iface.trim().is_empty())
 }
 
 #[cfg(not(windows))]
@@ -124,8 +113,8 @@ fn has_default_route_on_iface(iface: &str) -> bool {
     has_default_route_on(&content, iface)
 }
 
-// 解析 /proc/net/route 内容：指定接口上 Destination 为 00000000 且 Flags 含
-// RTF_UP(0x1) 的行即为默认路由。点对点链路（PPPoE 等）的 Gateway 可以为 0，不能据此排除。
+// 默认路由的 Destination 和 Mask 均为 0，需含 RTF_UP(0x1) 且不含 RTF_REJECT(0x200)。
+// 点对点链路（PPPoE 等）的 Gateway 可以为 0，不能据此排除。
 #[cfg(any(not(windows), test))]
 fn has_default_route_on(content: &str, iface: &str) -> bool {
     content.lines().skip(1).any(|line| {
@@ -135,23 +124,31 @@ fn has_default_route_on(content: &str, iface: &str) -> bool {
         else {
             return false;
         };
+        let Some(mask) = fields.nth(3) else {
+            return false;
+        };
 
         line_iface == iface
             && destination == "00000000"
-            && u32::from_str_radix(flags, 16).is_ok_and(|flags| flags & 0x1 != 0)
+            && mask == "00000000"
+            && u32::from_str_radix(flags, 16)
+                .is_ok_and(|flags| flags & 0x1 != 0 && flags & 0x200 == 0)
     })
 }
 
 #[cfg(not(windows))]
-fn campus_portal_reachable() -> bool {
-    // 探测校园网认证门户：仅当返回合法的 CSRF token 才视为处于校园网，
-    // 防止在其他网络环境下误向 172.30.21.100 提交认证请求。
-    use reqwest::blocking::Client;
+fn campus_portal_reachable(iface: &str) -> bool {
+    // 检查所选接口上的门户可达性；HTTP token 本身不能证明服务器身份。
     use std::time::Duration;
 
+    use crate::network::client_builder;
     use crate::portal_auth::CSRF_TOKEN_URL;
 
-    let Ok(client) = Client::builder().timeout(Duration::from_secs(3)).build() else {
+    let Ok(client) = client_builder(Some(iface))
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(3))
+        .build()
+    else {
         return false;
     };
 
@@ -164,8 +161,7 @@ fn campus_portal_reachable() -> bool {
         .is_some_and(|body| portal_response_has_csrf_token(&body))
 }
 
-// 仅当门户返回非空 CSRF token 才视为处于校园网；
-// 缺失字段、空字符串、非法 JSON 一律视为不在校园网。
+// 门户响应必须包含非空 CSRF token；这只是可达性检查，不是身份认证。
 #[cfg(any(not(windows), test))]
 fn portal_response_has_csrf_token(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
@@ -173,7 +169,7 @@ fn portal_response_has_csrf_token(body: &str) -> bool {
         .and_then(|json| {
             json.get("csrf_token")
                 .and_then(serde_json::Value::as_str)
-                .map(|token| !token.is_empty())
+                .map(|token| !token.trim().is_empty())
         })
         .unwrap_or(false)
 }
@@ -188,7 +184,7 @@ pub fn balance_insufficient_tip(campus_wifi: CampusWifi) -> &'static str {
         // 有线接入无法判断线路类型（WHUT-DORM / WHUT-ISP），提示保持中性。
         #[cfg(not(windows))]
         CampusWifi::Wired => {
-            "校园网余额不足，请到 selfaaa.whut.edu.cn 或 cwsf.whut.edu.cn 查询充值。"
+            "校园网余额不足，请按当前线路类型，通过学校或对应运营商的渠道查询并充值。"
         }
     }
 }
@@ -255,6 +251,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_default_masks_reject_routes_and_malformed_rows() {
+        for row in [
+            "eth0 00000000 0101A8C0 0003 0 0 0 00000080 0 0 0",
+            "eth0 00000000 0101A8C0 0201 0 0 0 00000000 0 0 0",
+            "eth0 00000000 0101A8C0 invalid 0 0 0 00000000 0 0 0",
+            "eth0 00000000 0101A8C0 0003",
+            "eth0",
+        ] {
+            assert!(!has_default_route_on(
+                &format!("{ROUTE_HEADER}{row}\n"),
+                "eth0"
+            ));
+        }
+    }
+
+    #[test]
     fn accepts_valid_csrf_token_response() {
         assert!(portal_response_has_csrf_token(
             r#"{"csrf_token":"jw_8-3wDi2wj4Ayi7bYYmGQXbtk="}"#
@@ -265,6 +277,9 @@ mod tests {
     fn rejects_missing_or_empty_csrf_token() {
         // 空 token 不可用，必须拒绝
         assert!(!portal_response_has_csrf_token(r#"{"csrf_token":""}"#));
+        assert!(!portal_response_has_csrf_token(r#"{"csrf_token":"   "}"#));
+        assert!(!portal_response_has_csrf_token(r#"{"csrf_token":null}"#));
+        assert!(!portal_response_has_csrf_token(r#"{"csrf_token":42}"#));
         // 字段缺失
         assert!(!portal_response_has_csrf_token(r#"{"code":0}"#));
         // 非法 JSON
