@@ -44,6 +44,9 @@ fn invalid_startup_protects_configuration_and_exits_without_network_wait() {
         "wired=true\nwired_interface=''",
         "wired=true\nwired_interface=' '",
         "wired=true\nwired_interface=' wan '",
+        "wired=true\nwired_interface='.'",
+        "wired=true\nwired_interface='..'",
+        "wired=true\nwired_interface='wan:0'",
     ] {
         let content = format!("username='fixture'\npassword='fixture-secret'\n{settings}");
         fs::write(&path, &content).unwrap();
