@@ -68,7 +68,7 @@ whut-wifi-maintainer --config /etc/whut-wifi-maintainer/config.toml --check-conf
 whut-wifi-maintainer --config /etc/whut-wifi-maintainer/config.toml --non-interactive
 ```
 
-`--config` 指定的文件不存在或无效时直接失败，不会回退到其他文件。未指定时仍依次检查程序同目录、当前目录；保存始终使用实际读取的路径。`--check-config` 只校验格式和设置，不联网、不修改文件，也不验证密码或接口实际可用性。
+`--config` 指定的文件不存在或无效时直接失败，不会回退到其他文件。未指定时仍依次检查程序同目录、当前目录；保存始终使用实际读取的路径。`--check-config` 只校验格式和设置，不联网、不改写正文；Unix 加载配置时始终先将权限收紧为 `0600`，权限调整失败立即退出，也不验证密码或接口实际可用性。
 
 `--non-interactive` 或标准输入不是终端时，明确的凭据拒绝会让程序退出并提示修改配置，不会反复索要密码。退出码 `0` 表示校验成功，`2` 表示配置、启动或凭据错误；常驻运行期间不会因单次网络请求失败退出。交互更改的凭据必须通过独立统一认证会话验证后才保存。
 

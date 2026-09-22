@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(thiserror::Error, Debug)]
@@ -196,7 +196,7 @@ impl ConfigStore {
     }
 
     pub fn load(&self) -> Result<Config, ConfigError> {
-        let content = fs::read_to_string(&self.path)?;
+        let content = read_config_file(&self.path, protect_config_file)?;
         let config: Config = toml::from_str(&content).map_err(|_| ConfigError::Parse)?;
         config.validate()?;
         Ok(config)
@@ -207,6 +207,43 @@ impl ConfigStore {
         let content = toml::to_string(config).map_err(|_| ConfigError::Serialize)?;
         Ok(atomic_write(&self.path, &content, |file| file.sync_all())?)
     }
+}
+
+fn read_config_file(
+    path: &Path,
+    protect: impl FnOnce(&fs::File) -> io::Result<()>,
+) -> io::Result<String> {
+    if !fs::metadata(path)?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "配置路径必须指向普通文件",
+        ));
+    }
+    let mut file = fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "配置路径必须指向普通文件",
+        ));
+    }
+    // Protect the opened file before reading any credentials, even malformed ones.
+    protect(&file).map_err(|error| {
+        io::Error::new(error.kind(), format!("无法将配置权限收紧为 0600: {error}"))
+    })?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+fn protect_config_file(file: &fs::File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
 }
 
 fn atomic_write(
@@ -252,6 +289,48 @@ fn atomic_write_with_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn protects_configuration_before_parsing_or_validation() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let store = ConfigStore { path: path.clone() };
+        for content in [
+            "username='test'\npassword='secret'",
+            "username=''\npassword=''",
+            "malformed",
+        ] {
+            fs::write(&path, content).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            let _ = store.load();
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), content);
+        }
+        let mode = fs::metadata(directory.path()).unwrap().permissions().mode();
+        assert!(read_config_file(directory.path(), protect_config_file).is_err());
+        assert_eq!(
+            fs::metadata(directory.path()).unwrap().permissions().mode(),
+            mode
+        );
+    }
+
+    #[test]
+    fn permission_failure_is_returned_before_reading() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, [0xff]).unwrap(); // Reading this as text would produce InvalidData.
+        let error = read_config_file(&path, |_| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("0600"));
+    }
 
     #[cfg(unix)]
     #[test]

@@ -14,6 +14,11 @@ fn validation_is_offline_and_does_not_rewrite_configuration() {
         "username='test'\npassword='secret'\nwired=true\nwired_interface='no-such-iface'\n"
     };
     std::fs::write(&path, config).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
     let output = binary()
         .args(["--non-interactive", "--check-config", "--config"])
         .arg(&path)
@@ -25,6 +30,14 @@ fn validation_is_offline_and_does_not_rewrite_configuration() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), config);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
     assert!(!String::from_utf8_lossy(&output.stdout).contains("secret"));
 }
 

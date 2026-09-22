@@ -28,7 +28,7 @@ struct Cli {
     /// 后台模式：凭据错误时退出，绝不请求终端输入。
     #[arg(long)]
     non_interactive: bool,
-    /// 只校验配置，不发送网络请求、不修改文件。
+    /// 只校验配置，不联网、不改写正文；Unix 收紧权限为 0600。
     #[arg(long)]
     check_config: bool,
 }
