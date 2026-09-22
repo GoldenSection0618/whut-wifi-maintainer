@@ -20,11 +20,39 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --component rustfmt
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - name: Check formatting
-        if: matrix.os == 'ubuntu-latest'
         run: cargo +stable fmt --all -- --check
       - name: Run tests
         run: cargo +stable test --locked
+      - name: Lint
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
       - name: Build release
         run: cargo +stable build --release --locked
+
+  openwrt:
+    name: OpenWrt ARM64 package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build prerequisites
+        run: sudo apt-get update -qq && sudo apt-get install -y libncurses-dev unzip zstd
+      - name: Install Rust target
+        run: rustup target add aarch64-unknown-linux-musl
+      - name: Download verified SDK
+        env:
+          BUILD_ROOT: ${{ runner.temp }}/openwrt
+        run: |
+          mkdir -p "$BUILD_ROOT"
+          url=$(python3 -c 'import json; print(json.load(open("packaging/openwrt/sdk.json"))["url"])')
+          digest=$(python3 -c 'import json; print(json.load(open("packaging/openwrt/sdk.json"))["sha256"])')
+          curl -fsSL --retry 3 "$url" -o "$BUILD_ROOT/sdk.tar.zst"
+          printf '%s  %s\n' "$digest" "$BUILD_ROOT/sdk.tar.zst" | sha256sum -c -
+          mkdir "$BUILD_ROOT/sdk"
+          tar --zstd -xf "$BUILD_ROOT/sdk.tar.zst" -C "$BUILD_ROOT/sdk" --strip-components=1
+          cd "$BUILD_ROOT/sdk"
+          ./scripts/feeds update base packages
+      - name: Test build isolation
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Build APK and manifest
+        run: python3 scripts/build_openwrt.py --sdk "${{ runner.temp }}/openwrt/sdk" --output "${{ runner.temp }}/openwrt/output" --system-rust --package-release 1

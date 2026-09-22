@@ -1,173 +1,301 @@
 use reqwest::blocking::Client;
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue, REFERER, USER_AGENT};
+use reqwest::header::{HeaderValue, REFERER};
 use serde_json::Value;
-use std::error::Error;
-use std::time::Duration;
 
-use crate::USER_AGENT_VALUE;
-use crate::network::is_network_ok;
+use crate::network::RequestError;
+use crate::protocol::{CSRF_TOKEN_URL, LOGIN_URL, REDIRECT_URL, credentials_rejected};
 
-const REDIRECT_URL: &str = "http://www.msftconnecttest.com/redirect";
-const CSRF_TOKEN_URL: &str = "http://172.30.21.100/api/csrf-token";
-const LOGIN_URL: &str = "http://172.30.21.100/api/account/login";
-
-struct AuthContext {
-    referer: Option<String>,
-    nas_id: String,
-    from_redirect: bool,
-}
-
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortalLoginOutcome {
-    Verified,
-    Rejected,
-    Inconclusive,
+    Accepted,
+    CredentialsRejected,
     BalanceInsufficient,
+    Inconclusive,
 }
 
-fn build_client() -> Result<Client, Box<dyn Error>> {
-    Ok(Client::builder()
-        .cookie_store(true)
-        .user_agent(USER_AGENT_VALUE)
-        .build()?)
-}
-
-fn extract_nas_id(final_url: &str) -> String {
-    reqwest::Url::parse(final_url)
-        .ok()
-        .and_then(|url| {
-            url.query_pairs()
-                .find(|(key, _)| key == "nasId")
-                .map(|(_, value)| value.into_owned())
-        })
-        .unwrap_or_else(|| "52".to_string())
-}
-
-fn auth_context(client: &Client, verbose: bool) -> AuthContext {
-    // 门户重定向携带当前接入点的 nasId，并可作为后续请求的 Referer。
-    match client
-        .get(REDIRECT_URL)
-        .timeout(Duration::from_secs(10))
-        .send()
-    {
-        Ok(resp) => {
-            let final_url = resp.url().to_string();
-            let nas_id = extract_nas_id(&final_url);
-
-            if verbose {
-                println!("[*] 已重定向到认证页面: {final_url}");
-                println!("[*] nasId = {nas_id}");
-            }
-
-            AuthContext {
-                referer: Some(final_url),
-                nas_id,
-                from_redirect: true,
-            }
-        }
-        Err(err) => {
-            if verbose {
-                println!("[!] 重定向检查失败: {err}");
-                println!("[*] 使用默认 nasId = 52 继续尝试");
-            }
-
-            AuthContext {
-                referer: None,
-                nas_id: "52".to_string(),
-                from_redirect: false,
-            }
-        }
+fn extract_nas_id(final_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(final_url).ok()?;
+    let portal = reqwest::Url::parse(LOGIN_URL).ok()?;
+    if url.origin() != portal.origin() {
+        return None;
     }
-}
-
-fn response_message(result: &Value) -> Option<&str> {
-    result
-        .get("authMsg")
-        .and_then(Value::as_str)
-        .filter(|msg| !msg.is_empty())
-        .or_else(|| {
-            result
-                .get("msg")
-                .and_then(Value::as_str)
-                .filter(|msg| !msg.is_empty())
+    url.query_pairs()
+        .find(|(key, value)| {
+            key == "nasId" && !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
         })
+        .map(|(_, value)| value.into_owned())
 }
 
-pub fn login(
-    username: &str,
-    password: &str,
-    verbose: bool,
-) -> Result<PortalLoginOutcome, Box<dyn Error>> {
-    let client = build_client()?;
-    let auth_context = auth_context(&client, verbose);
+pub fn csrf_token(json: &Value) -> Result<&str, RequestError> {
+    json.get("csrf_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.trim().is_empty())
+        .ok_or(RequestError::Protocol)
+}
 
-    let csrf_json: Value = client
+pub fn reachable(client: &Client) -> Result<(), RequestError> {
+    let json: Value = client
         .get(CSRF_TOKEN_URL)
-        .timeout(Duration::from_secs(5))
         .send()?
         .error_for_status()?
         .json()?;
-    let Some(csrf_token) = csrf_json.get("csrf_token").and_then(Value::as_str) else {
-        println!("[!] 获取 CSRF token 失败");
-        return Ok(PortalLoginOutcome::Rejected);
-    };
+    csrf_token(&json).map(|_| ())
+}
 
-    if verbose {
-        println!("[*] 已获取 CSRF token");
-    }
-
-    let mut headers = HeaderMap::new();
-    headers.insert("X-CSRF-Token", HeaderValue::from_str(csrf_token)?);
-    headers.insert(
-        "X-Requested-With",
-        HeaderValue::from_static("XMLHttpRequest"),
-    );
-    if let Some(referer) = &auth_context.referer {
-        headers.insert(REFERER, HeaderValue::from_str(referer)?);
-    }
-    headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("application/x-www-form-urlencoded; charset=UTF-8"),
-    );
-    headers.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
-
-    let login_resp = client
-        .post(LOGIN_URL)
-        .headers(headers)
-        .form(&[
-            ("username", username),
-            ("password", password),
-            ("nasId", auth_context.nas_id.as_str()),
-        ])
-        .timeout(Duration::from_secs(10))
-        .send()?
-        .error_for_status()?;
-    let result: Value = login_resp.json()?;
-
-    if verbose {
-        println!("[*] 登录响应: {result}");
-    }
-
+fn classify_response(result: &Value) -> PortalLoginOutcome {
     if result.get("code").and_then(Value::as_i64) == Some(0)
         || result.get("msg").and_then(Value::as_str) == Some("success")
     {
-        if !auth_context.from_redirect && is_network_ok() {
-            Ok(PortalLoginOutcome::Inconclusive)
-        } else {
-            if verbose {
-                println!("[+] 登录成功");
-            }
-            Ok(PortalLoginOutcome::Verified)
-        }
+        return PortalLoginOutcome::Accepted;
+    }
+    let message = result
+        .get("authMsg")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| result.get("msg").and_then(Value::as_str))
+        .unwrap_or("");
+    if message.contains("余额不足") {
+        PortalLoginOutcome::BalanceInsufficient
+    } else if credentials_rejected(message) {
+        PortalLoginOutcome::CredentialsRejected
     } else {
-        if let Some(message) = response_message(&result) {
-            // 计费失败不代表凭据错误，不能触发重新输入账号密码。
-            if message.contains("余额不足") {
-                return Ok(PortalLoginOutcome::BalanceInsufficient);
-            }
-            println!("[-] 登录失败: {message}");
-        } else {
-            println!("[-] 登录失败: {result}");
+        PortalLoginOutcome::Inconclusive
+    }
+}
+
+pub fn login(
+    client: &Client,
+    discovery: &Client,
+    username: &str,
+    password: &str,
+    fallback_nas_id: &str,
+) -> Result<PortalLoginOutcome, RequestError> {
+    login_at(
+        client,
+        discovery,
+        username,
+        password,
+        fallback_nas_id,
+        &Endpoints {
+            redirect: REDIRECT_URL,
+            csrf: CSRF_TOKEN_URL,
+            login: LOGIN_URL,
+        },
+    )
+}
+
+struct Endpoints<'a> {
+    redirect: &'a str,
+    csrf: &'a str,
+    login: &'a str,
+}
+
+fn login_at(
+    client: &Client,
+    discovery: &Client,
+    username: &str,
+    password: &str,
+    fallback_nas_id: &str,
+    endpoints: &Endpoints<'_>,
+) -> Result<PortalLoginOutcome, RequestError> {
+    // Only a redirect to the known portal may supply nasId or Referer.
+    let redirect = discovery
+        .get(endpoints.redirect)
+        .send()
+        .ok()
+        .and_then(|response| {
+            extract_nas_id(response.url().as_str()).map(|nas| (response.url().clone(), nas))
+        });
+    let nas_id = redirect
+        .as_ref()
+        .map(|(_, nas)| nas.as_str())
+        .unwrap_or(fallback_nas_id);
+    let json: Value = client
+        .get(endpoints.csrf)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let token = HeaderValue::from_str(csrf_token(&json)?).map_err(|_| RequestError::Protocol)?;
+    let mut request = client
+        .post(endpoints.login)
+        .header("X-CSRF-Token", token)
+        .header("X-Requested-With", "XMLHttpRequest")
+        .form(&[
+            ("username", username),
+            ("password", password),
+            ("nasId", nas_id),
+        ]);
+    if let Some((url, _)) = redirect {
+        request = request.header(REFERER, url.as_str());
+    }
+    let response = request.send()?;
+    // Never follow redirects from a credential-bearing request.
+    if response.status().is_redirection() {
+        return Err(RequestError::Protocol);
+    }
+    let result: Value = response.error_for_status()?.json()?;
+    Ok(classify_response(&result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{response, serve};
+    use serde_json::json;
+
+    #[test]
+    fn production_portal_client_never_forwards_credentials_on_307() {
+        use crate::config::{Config, Credentials};
+        use crate::network::HttpClients;
+        use std::net::TcpListener;
+        let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let redirect = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{}/capture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            destination.local_addr().unwrap()
+        );
+        let (url, server) = serve(vec![
+            response("200 OK", "discovery"),
+            response("200 OK", "{\"csrf_token\":\"token\"}"),
+            redirect,
+        ]);
+        let config = Config::new(Credentials {
+            username: "student".into(),
+            password: "secret".into(),
+        });
+        let clients = HttpClients::new(&config).unwrap();
+        let result = login_at(
+            &clients.portal,
+            &clients.discovery,
+            "student",
+            "secret",
+            "52",
+            &Endpoints {
+                redirect: &url,
+                csrf: &url,
+                login: &url,
+            },
+        );
+        assert!(matches!(result, Err(RequestError::Protocol)), "{result:?}");
+        let requests = server.join().unwrap();
+        assert!(requests[2].contains("password=secret"));
+        assert_eq!(
+            destination.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn malformed_csrf_never_submits_credentials() {
+        let (url, server) = serve(vec![
+            response("200 OK", "discovery"),
+            response("200 OK", "{\"csrf_token\":\" \"}"),
+        ]);
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let result = login_at(
+            &client,
+            &client,
+            "student",
+            "secret",
+            "52",
+            &Endpoints {
+                redirect: &url,
+                csrf: &url,
+                login: &url,
+            },
+        );
+        assert!(matches!(result, Err(RequestError::Protocol)));
+        assert!(
+            server
+                .join()
+                .unwrap()
+                .iter()
+                .all(|request| request.starts_with("GET "))
+        );
+    }
+
+    #[test]
+    fn real_http_exchange_returns_accepted_not_online() {
+        let (url, server) = serve(vec![
+            response("200 OK", "discovery"),
+            response("200 OK", "{\"csrf_token\":\"token\"}"),
+            response("200 OK", "{\"code\":0}"),
+        ]);
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        assert_eq!(
+            login_at(
+                &client,
+                &client,
+                "student",
+                "secret",
+                "77",
+                &Endpoints {
+                    redirect: &url,
+                    csrf: &url,
+                    login: &url
+                }
+            )
+            .unwrap(),
+            PortalLoginOutcome::Accepted
+        );
+        let requests = server.join().unwrap();
+        assert!(requests[2].starts_with("POST "));
+        assert!(requests[2].contains("nasId=77"));
+        assert!(requests[2].contains("password=secret"));
+    }
+
+    #[test]
+    fn accepts_only_nonempty_csrf() {
+        assert_eq!(csrf_token(&json!({"csrf_token":"token"})).unwrap(), "token");
+        for value in [
+            json!({}),
+            json!({"csrf_token":null}),
+            json!({"csrf_token":"  "}),
+            json!({"csrf_token":42}),
+        ] {
+            assert!(csrf_token(&value).is_err());
         }
-        Ok(PortalLoginOutcome::Rejected)
+    }
+
+    #[test]
+    fn classifies_auth_results_without_claiming_connectivity() {
+        assert_eq!(
+            classify_response(&json!({"code":0})),
+            PortalLoginOutcome::Accepted
+        );
+        assert_eq!(
+            classify_response(&json!({"authMsg":"密码错误"})),
+            PortalLoginOutcome::CredentialsRejected
+        );
+        assert_eq!(
+            classify_response(&json!({"authMsg":"余额不足"})),
+            PortalLoginOutcome::BalanceInsufficient
+        );
+        assert_eq!(
+            classify_response(&json!({"msg":"服务器繁忙"})),
+            PortalLoginOutcome::Inconclusive
+        );
+        assert_eq!(
+            classify_response(&json!({})),
+            PortalLoginOutcome::Inconclusive
+        );
+    }
+
+    #[test]
+    fn nas_id_is_only_taken_from_known_portal() {
+        assert_eq!(
+            extract_nas_id("http://172.30.21.100/?nasId=123"),
+            Some("123".into())
+        );
+        assert_eq!(extract_nas_id("http://example.com/?nasId=123"), None);
+        assert_eq!(extract_nas_id("http://172.30.21.100/?nasId=bad"), None);
     }
 }
