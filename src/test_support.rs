@@ -32,6 +32,8 @@ pub fn serve_with_body_delay(
                     Err(error) => panic!("mock accept failed: {error}"),
                 }
             };
+            // Accepted sockets inherit nonblocking mode on Windows.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
