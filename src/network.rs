@@ -99,12 +99,12 @@ impl ProbeReport {
 }
 
 pub fn client_builder(wired_interface: Option<&str>) -> ClientBuilder {
-    let builder = Client::builder();
+    let builder = Client::builder().no_proxy();
     #[cfg(target_os = "linux")]
     if let Some(iface) = wired_interface {
         // 路由表检查不能约束实际出口；将所有有线模式 HTTP 连接绑定到 WAN，
         // 并禁用环境代理，避免探测或凭据经由另一个出口发出。
-        return builder.interface(iface).no_proxy();
+        return builder.interface(iface);
     }
     #[cfg(not(target_os = "linux"))]
     let _ = wired_interface;

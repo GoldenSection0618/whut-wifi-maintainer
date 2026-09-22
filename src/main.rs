@@ -3,6 +3,7 @@ mod monitor;
 mod network;
 mod portal_auth;
 mod protocol;
+mod runtime;
 #[cfg(test)]
 mod test_support;
 mod unified_auth;
@@ -10,9 +11,9 @@ mod wifi;
 
 use clap::Parser;
 use config::{Config, ConfigError, ConfigStore, Credentials};
-use monitor::{Action, Monitor};
-use network::{HttpClients, Reachability};
+use network::{HttpClients, ProbeReport, RequestError};
 use portal_auth::PortalLoginOutcome;
+use runtime::{Event, Next, Runtime};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -167,128 +168,90 @@ fn run(cli: Cli) -> Result<(), String> {
     }
     let clients = HttpClients::new(&config).map_err(|e| e.to_string())?;
     let interval = Duration::from_secs(config.monitor.interval_secs);
-    let mut monitor = Monitor::new(interval);
+    let mut runtime = Runtime::new(interval, pending_credentials, interactive);
+    let mut network = LiveNetwork { clients };
+    let mut store = store;
     let started = Instant::now();
-    let mut next_verification = Duration::ZERO;
-    let mut verified = false;
     let mut previous = String::new();
     println!("WHUT 校园网保持器已启动；配置: {}", store.path().display());
-
     loop {
-        let connection = match campus_connection(&config) {
-            Ok(connection) => connection,
-            Err(message) => {
-                monitor.disconnected();
-                report_change(&mut previous, message);
-                std::thread::sleep(interval);
-                continue;
+        let cycle = runtime
+            .step(&config, &mut network, &mut store, || started.elapsed())
+            .map_err(|error| error.to_string())?;
+        for event in cycle.events {
+            report_change(&mut previous, &event_message(event));
+        }
+        match cycle.next {
+            Next::Wait(delay) => std::thread::sleep(delay),
+            Next::RequestCredentials => {
+                config.update_credentials(replacement_credentials(interactive)?);
+                runtime.credentials_changed();
             }
-        };
-        let report = network::probe(&clients.probe, &config.monitor);
-        let reachability = report.reachability();
-        let now = started.elapsed();
-        match monitor.observe(reachability, now) {
-            Action::Healthy => {
-                report_change(&mut previous, "[+] HTTP 与 HTTPS 探测均通过，网络正常。")
-            }
-            Action::Partial => report_change(
-                &mut previous,
-                &format!(
-                    "[!] 网络部分可达；HTTP={:?} HTTPS={:?}，本轮不重新认证。",
-                    report.http, report.https
-                ),
-            ),
-            Action::Wait => report_change(
-                &mut previous,
-                "[!] 外网探测未通过，等待下一轮确认或重试间隔。",
-            ),
-            Action::Authenticate => {
-                monitor.attempted(now);
-                // Portal reachability is an authentication prerequisite, not an internet health signal.
-                match portal_auth::reachable(&clients.portal) {
-                    Err(error) => {
-                        report_change(&mut previous, &format!("[!] 认证门户不可用: {error}"))
-                    }
-                    Ok(()) => match portal_auth::login(
-                        &clients.portal,
-                        &clients.discovery,
-                        &config.username,
-                        &config.password,
-                        &config.portal.fallback_nas_id,
-                    ) {
-                        Ok(PortalLoginOutcome::Accepted) => {
-                            report_change(
-                                &mut previous,
-                                "[*] 认证请求已被接受，正在复核外网连通性。",
-                            );
-                            let after = network::probe(&clients.probe, &config.monitor);
-                            if after.reachability() == Reachability::Online {
-                                monitor.observe(Reachability::Online, started.elapsed());
-                                report_change(
-                                    &mut previous,
-                                    "[+] HTTP 与 HTTPS 探测均通过，网络已恢复。",
-                                );
-                            } else {
-                                report_change(
-                                    &mut previous,
-                                    "[!] 认证请求已被接受，但外网尚未完全恢复。",
-                                );
-                            }
-                        }
-                        Ok(PortalLoginOutcome::CredentialsRejected) => {
-                            config.update_credentials(replacement_credentials(interactive)?);
-                            verified = false;
-                            pending_credentials = true;
-                            next_verification = Duration::ZERO;
-                        }
-                        Ok(PortalLoginOutcome::BalanceInsufficient) => {
-                            report_change(&mut previous, wifi::balance_insufficient_tip(connection))
-                        }
-                        Ok(PortalLoginOutcome::Inconclusive) => {
-                            report_change(&mut previous, "[!] 门户未返回明确认证结果，将稍后重试。")
-                        }
-                        Err(error) => {
-                            report_change(&mut previous, &format!("[!] 认证请求失败: {error}"))
-                        }
-                    },
-                }
+            Next::ExitCredentialsRejected => {
+                return Err("凭据被明确拒绝；后台模式已退出，请修正配置后重启服务".into());
             }
         }
+    }
+}
 
-        // A temporary unified-auth failure must not suspend connectivity monitoring.
-        if reachability == Reachability::Online && !verified && now >= next_verification {
-            next_verification = now.saturating_add(interval.max(Duration::from_secs(30)));
-            match network::credential_session(&config).and_then(|session| {
-                unified_auth::verify_credentials(&session, &config.username, &config.password)
-            }) {
-                Ok(CredentialVerification::Valid) => {
-                    verified = true;
-                    if pending_credentials {
-                        if let config::SaveOutcome::DurabilityUnconfirmed(error) =
-                            store.save(&config).map_err(|e| e.to_string())?
-                        {
-                            eprintln!(
-                                "[!] 新配置已替换，但目录同步失败，断电持久性未确认: {error}"
-                            );
-                        }
-                        pending_credentials = false;
-                        println!("[+] 新凭据已验证并保存。");
-                    }
-                }
-                Ok(CredentialVerification::Invalid) => {
-                    config.update_credentials(replacement_credentials(interactive)?);
-                    pending_credentials = true;
-                    // Interactive users can verify a correction without the background retry delay.
-                    next_verification = Duration::ZERO;
-                    continue;
-                }
-                Ok(CredentialVerification::Inconclusive) => {
-                    eprintln!("[!] 凭据校验结果不明确；继续监测网络，稍后重试。")
-                }
-                Err(error) => eprintln!("[!] 凭据校验暂不可用: {error}；继续监测网络。"),
-            }
+struct LiveNetwork {
+    clients: HttpClients,
+}
+
+impl runtime::Network for LiveNetwork {
+    fn connection(&mut self, config: &Config) -> Result<wifi::CampusWifi, &'static str> {
+        campus_connection(config)
+    }
+    fn probe(&mut self, config: &Config) -> ProbeReport {
+        network::probe(&self.clients.probe, &config.monitor)
+    }
+    fn authenticate(&mut self, config: &Config) -> Result<PortalLoginOutcome, RequestError> {
+        portal_auth::reachable(&self.clients.portal)?;
+        portal_auth::login(
+            &self.clients.portal,
+            &self.clients.discovery,
+            &config.username,
+            &config.password,
+            &config.portal.fallback_nas_id,
+        )
+    }
+    fn verify(&mut self, config: &Config) -> Result<CredentialVerification, RequestError> {
+        network::credential_session(config).and_then(|session| {
+            unified_auth::verify_credentials(&session, &config.username, &config.password)
+        })
+    }
+}
+
+impl runtime::CredentialStore for ConfigStore {
+    fn save(&mut self, config: &Config) -> Result<config::SaveOutcome, ConfigError> {
+        ConfigStore::save(self, config)
+    }
+}
+
+fn event_message(event: Event) -> String {
+    match event {
+        Event::Disconnected(reason) => reason.into(),
+        Event::Healthy => "[+] HTTP 与 HTTPS 探测均通过，网络正常。".into(),
+        Event::Partial(report) => format!(
+            "[!] 网络部分可达；HTTP={:?} HTTPS={:?}，本轮不重新认证。",
+            report.http, report.https
+        ),
+        Event::Waiting => "[!] 外网探测未通过，等待下一轮确认或重试间隔。".into(),
+        Event::Recovered => "[+] 认证请求已被接受，HTTP 与 HTTPS 探测均通过，网络已恢复。".into(),
+        Event::AcceptedButUnreachable => "[!] 认证请求已被接受，但外网尚未完全恢复。".into(),
+        Event::BalanceInsufficient(connection) => wifi::balance_insufficient_tip(connection).into(),
+        Event::AuthInconclusive => "[!] 门户未返回明确认证结果，将稍后重试。".into(),
+        Event::AuthFailed(error) => format!("[!] 认证请求失败: {error}"),
+        Event::VerificationInconclusive => {
+            "[!] 凭据校验结果不明确；继续监测网络，稍后重试。".into()
         }
-        std::thread::sleep(interval);
+        Event::VerificationFailed(error) => {
+            format!("[!] 凭据校验暂不可用: {error}；继续监测网络。")
+        }
+        Event::CredentialsSaved => "[+] 新凭据已验证并保存。".into(),
+        Event::DurabilityUnconfirmed(error) => {
+            format!("[!] 新配置已替换，但目录同步失败，断电持久性未确认: {error}")
+        }
     }
 }
 

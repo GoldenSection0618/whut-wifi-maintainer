@@ -144,6 +144,48 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn production_portal_client_never_forwards_credentials_on_307() {
+        use crate::config::{Config, Credentials};
+        use crate::network::HttpClients;
+        use std::net::TcpListener;
+        let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let redirect = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{}/capture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            destination.local_addr().unwrap()
+        );
+        let (url, server) = serve(vec![
+            response("200 OK", "discovery"),
+            response("200 OK", "{\"csrf_token\":\"token\"}"),
+            redirect,
+        ]);
+        let config = Config::new(Credentials {
+            username: "student".into(),
+            password: "secret".into(),
+        });
+        let clients = HttpClients::new(&config).unwrap();
+        let result = login_at(
+            &clients.portal,
+            &clients.discovery,
+            "student",
+            "secret",
+            "52",
+            &Endpoints {
+                redirect: &url,
+                csrf: &url,
+                login: &url,
+            },
+        );
+        assert!(matches!(result, Err(RequestError::Protocol)), "{result:?}");
+        let requests = server.join().unwrap();
+        assert!(requests[2].contains("password=secret"));
+        assert_eq!(
+            destination.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
     fn malformed_csrf_never_submits_credentials() {
         let (url, server) = serve(vec![
             response("200 OK", "discovery"),
