@@ -42,7 +42,7 @@ whut-wifi-maintainer --config /etc/whut-wifi-maintainer/config.toml --check-conf
 
 应用升级只安装新的 APK；无需重新制作内核镜像。保留上一版本 APK 和配置备份，记录实际执行程序的哈希。配置已声明为 conffile，并加入 sysupgrade 保留清单；正常保留配置的升级应保留它，`sysupgrade -n` 会明确清除配置。
 
-安装后运行离线校验并重启服务，确认 HTTP 与 HTTPS 两项均通过，再安排一次设备重启验证自启动及配置保留。回退时安装保存的上一版本 APK（apk 降级可使用 `apk add --allow-untrusted --force-old-apk /tmp/previous.apk`），重新验证。配置 schema 保持向后兼容；仍应保留相应版本备份。
+安装后运行离线校验并重启服务，确认 HTTP 与 HTTPS 两项均通过，再安排一次设备重启验证自启动及配置保留。回退时显式安装保存的上一版本本地 APK（`apk add --allow-untrusted /tmp/previous.apk`），核对安装版本后重新验证。`--force-old-apk` 用于不兼容的包格式，不是降级开关。配置 schema 保持向后兼容；仍应保留相应版本备份。
 
 固件升级与应用升级是不同操作：固件升级可能需要重新安装应用包，应提前保存同目标版本可用的离线包。不要把包含旧内核模块、旧基础系统脚本的整个 /etc 或根目录直接覆盖到新版本。
 

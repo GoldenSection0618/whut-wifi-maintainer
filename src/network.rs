@@ -213,26 +213,18 @@ mod probe_tests {
 
     #[test]
     fn response_body_timeout_is_reported_as_timeout() {
-        use std::io::Write;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
-                .unwrap();
-            std::thread::sleep(Duration::from_millis(250));
-        });
+        let (url, server) = crate::test_support::serve_with_body_delay(
+            vec![response("200 OK", "expected")],
+            Duration::from_secs(1),
+        );
         let client = Client::builder()
             .no_proxy()
-            .timeout(Duration::from_millis(100))
+            .timeout(Duration::from_millis(200))
             .build()
             .unwrap();
-        assert_eq!(
-            probe_one(&client, &url, Some("expected")),
-            Err(ProbeFailure::Timeout)
-        );
+        let result = probe_one(&client, &url, Some("expected"));
         server.join().unwrap();
+        assert_eq!(result, Err(ProbeFailure::Timeout));
     }
 
     fn client() -> Client {

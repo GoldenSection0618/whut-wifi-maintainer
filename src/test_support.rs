@@ -5,6 +5,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub fn serve(responses: Vec<String>) -> (String, JoinHandle<Vec<String>>) {
+    serve_with_body_delay(responses, Duration::ZERO)
+}
+
+pub fn serve_with_body_delay(
+    responses: Vec<String>,
+    delay: Duration,
+) -> (String, JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -46,7 +53,13 @@ pub fn serve(responses: Vec<String>) -> (String, JoinHandle<Vec<String>>) {
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
             requests.push(headers + &String::from_utf8(body).unwrap());
-            stream.write_all(response.as_bytes()).unwrap();
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            write!(stream, "{headers}\r\n\r\n").unwrap();
+            thread::sleep(delay);
+            // A timeout test intentionally lets the client close before the body arrives.
+            if let Err(error) = stream.write_all(body.as_bytes()) {
+                assert!(!delay.is_zero(), "mock response failed: {error}");
+            }
         }
         requests
     });
