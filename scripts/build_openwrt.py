@@ -67,22 +67,22 @@ def main() -> None:
     packages = sorted((sdk / "bin").rglob(f"{package}-{version}-r*.apk"))
     if len(packages) != 1:
         raise RuntimeError(f"Expected one APK, found {len(packages)}")
-    output.mkdir(parents=True, exist_ok=True)
-    artifact = output / packages[0].name
-    shutil.copy2(packages[0], artifact)
     config = config_path.read_text()
     architecture = re.search(r'^CONFIG_TARGET_ARCH_PACKAGES="([^"]+)"$', config, re.M)
     if not architecture:
         raise RuntimeError("SDK did not report its package architecture")
-    binaries = list((sdk / "build_dir").glob(f"target-*/{package}-{version}/ipkg-install/bin/{package}"))
+    binaries = list((sdk / "build_dir").glob(f"target-*/{package}-{version}/.pkgdir/{package}/usr/bin/{package}"))
     if len(binaries) != 1:
         raise RuntimeError(f"Expected one installed binary, found {len(binaries)}")
-    binary = output / package
-    shutil.copy2(binaries[0], binary)
     version_metadata = (sdk / "include/version.mk").read_text()
     sdk_version = re.search(r"^VERSION_NUMBER:.*,(\d+\.\d+\.\d+)\)$", version_metadata, re.M)
     if not sdk_version:
         raise RuntimeError("SDK release metadata was not recognized")
+    output.mkdir(parents=True, exist_ok=True)
+    artifact = output / packages[0].name
+    binary = output / package
+    shutil.copy2(packages[0], artifact)
+    shutil.copy2(binaries[0], binary)
     manifest = {
         "version": version, "source_commit": commit, "source_archive_sha256": sha256(archive),
         "architecture": architecture[1],
