@@ -4,8 +4,7 @@ use serde_json::Value;
 use std::error::Error;
 use std::time::Duration;
 
-use crate::USER_AGENT_VALUE;
-use crate::network::{client_builder, is_network_ok};
+use crate::network::{USER_AGENT_VALUE, client_builder, is_network_ok};
 
 const REDIRECT_URL: &str = "http://www.msftconnecttest.com/redirect";
 pub(crate) const CSRF_TOKEN_URL: &str = "http://172.30.21.100/api/csrf-token";

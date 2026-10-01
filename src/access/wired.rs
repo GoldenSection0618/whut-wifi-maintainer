@@ -1,110 +1,25 @@
-#[cfg(windows)]
-use windows::Networking::Connectivity::{NetworkConnectivityLevel, NetworkInformation};
-#[cfg(windows)]
-use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
+use super::{AccessBlocker, CampusNetwork};
+use crate::config::Config;
 
-#[derive(Clone, Copy)]
-#[allow(dead_code)] // 各平台仅构造部分变体：Windows 为 Wi-Fi SSID，Linux 为有线接入。
-pub enum CampusWifi {
-    Wlan,
-    Dorm,
-    Isp,
-    /// 有线接入校园网（Linux/OpenWrt 路由器等场景）。
-    #[cfg(not(windows))]
-    Wired,
-}
-
-#[cfg(windows)]
-pub fn initialize_windows_runtime() {
-    // WinRT 网络接口在后续轮询中复用，因此只在进程启动时初始化一次。
-    unsafe {
-        let _ = RoInitialize(RO_INIT_MULTITHREADED);
-    }
-}
-
-#[cfg(not(windows))]
-pub fn initialize_windows_runtime() {}
-
-#[cfg(any(windows, test))]
-fn campus_wifi(ssid: &str) -> Option<CampusWifi> {
-    match ssid {
-        "WHUT-WLAN" => Some(CampusWifi::Wlan),
-        "WHUT-DORM" => Some(CampusWifi::Dorm),
-        "WHUT-ISP" => Some(CampusWifi::Isp),
-        _ => None,
-    }
-}
-
-#[cfg(windows)]
-pub fn current_campus_wifi() -> Option<CampusWifi> {
-    NetworkInformation::GetConnectionProfiles()
-        .ok()
-        .into_iter()
-        .flatten()
-        // 此列表也包含已保存但未连接的网络，必须排除无连通性的历史配置。
-        .filter(|profile| {
-            matches!(
-                profile.GetNetworkConnectivityLevel(),
-                Ok(level) if level != NetworkConnectivityLevel::None
-            )
-        })
-        .filter_map(|profile| profile.WlanConnectionProfileDetails().ok())
-        .filter_map(|details| details.GetConnectedSsid().ok())
-        .find_map(|ssid| campus_wifi(&ssid.to_string()))
-}
-
-/// Linux 有线接入被阻塞的原因，用于给出与实际判断一致的提示。
-#[cfg(not(windows))]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum WiredBlocker {
-    /// 未在 config.toml 中显式开启有线模式并绑定接口。
-    NotEnabled,
-    /// 绑定接口上没有可用的默认路由。
-    NoDefaultRoute,
-    /// 有默认路由但校园网认证门户探测失败。
-    PortalUnreachable,
-}
-
-#[cfg(not(windows))]
-impl WiredBlocker {
-    pub fn message(self) -> &'static str {
-        match self {
-            WiredBlocker::NotEnabled => {
-                "[*] 有线模式未开启：请在 config.toml 中设置 wired = true 并用 wired_interface 绑定 WAN 接口（如 eth0）后再启动。"
-            }
-            WiredBlocker::NoDefaultRoute => {
-                "[*] 绑定接口暂无可用的 IPv4 默认路由，等待接入校园网。"
-            }
-            WiredBlocker::PortalUnreachable => {
-                "[*] 绑定接口已有默认路由，但无法访问校园网认证门户，等待接入 WHUT 校园网。"
-            }
-        }
-    }
-}
-
-#[cfg(not(windows))]
-pub fn current_campus_wifi_detailed(
-    config: &crate::config::Config,
-) -> Result<CampusWifi, WiredBlocker> {
+pub(super) fn current_campus_network(config: &Config) -> Result<CampusNetwork, AccessBlocker> {
     // 有线模式必须由用户显式开启并绑定指定接口：HTTP 门户返回 token
     // 并不能证明服务器身份，不能把"有默认路由 + 能访问某内网地址"
     // 当作已接入校园网的充分证据。
     let Some(iface) = config.wired_interface() else {
-        return Err(WiredBlocker::NotEnabled);
+        return Err(AccessBlocker::NotEnabled);
     };
 
     if !has_default_route_on_iface(iface) {
-        return Err(WiredBlocker::NoDefaultRoute);
+        return Err(AccessBlocker::NoDefaultRoute);
     }
 
     if campus_portal_reachable(iface) {
-        Ok(CampusWifi::Wired)
+        Ok(CampusNetwork::Wired)
     } else {
-        Err(WiredBlocker::PortalUnreachable)
+        Err(AccessBlocker::PortalUnreachable)
     }
 }
 
-#[cfg(not(windows))]
 fn has_default_route_on_iface(iface: &str) -> bool {
     let Ok(content) = std::fs::read_to_string("/proc/net/route") else {
         return false;
@@ -115,7 +30,6 @@ fn has_default_route_on_iface(iface: &str) -> bool {
 
 // 默认路由的 Destination 和 Mask 均为 0，需含 RTF_UP(0x1) 且不含 RTF_REJECT(0x200)。
 // 点对点链路（PPPoE 等）的 Gateway 可以为 0，不能据此排除。
-#[cfg(any(not(windows), test))]
 fn has_default_route_on(content: &str, iface: &str) -> bool {
     content.lines().skip(1).any(|line| {
         let mut fields = line.split_whitespace();
@@ -136,7 +50,6 @@ fn has_default_route_on(content: &str, iface: &str) -> bool {
     })
 }
 
-#[cfg(not(windows))]
 fn campus_portal_reachable(iface: &str) -> bool {
     // 检查所选接口上的门户可达性；HTTP token 本身不能证明服务器身份。
     use std::time::Duration;
@@ -162,7 +75,6 @@ fn campus_portal_reachable(iface: &str) -> bool {
 }
 
 // 门户响应必须包含非空 CSRF token；这只是可达性检查，不是身份认证。
-#[cfg(any(not(windows), test))]
 fn portal_response_has_csrf_token(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -174,33 +86,9 @@ fn portal_response_has_csrf_token(body: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn balance_insufficient_tip(campus_wifi: CampusWifi) -> &'static str {
-    match campus_wifi {
-        CampusWifi::Dorm => {
-            "WHUT-DORM 余额不足，请到 selfaaa.whut.edu.cn 或 cwsf.whut.edu.cn 充值。"
-        }
-        CampusWifi::Isp => "WHUT-ISP 余额不足，请通过对应运营商渠道充值。",
-        CampusWifi::Wlan => "WHUT-WLAN 不收费，认证服务器返回了异常计费结果。",
-        // 有线接入无法判断线路类型（WHUT-DORM / WHUT-ISP），提示保持中性。
-        #[cfg(not(windows))]
-        CampusWifi::Wired => {
-            "校园网余额不足，请按当前线路类型，通过学校或对应运营商的渠道查询并充值。"
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{campus_wifi, has_default_route_on, portal_response_has_csrf_token};
-
-    #[test]
-    fn recognizes_campus_wifi_ssids() {
-        assert!(campus_wifi("WHUT-WLAN").is_some());
-        assert!(campus_wifi("WHUT-DORM").is_some());
-        assert!(campus_wifi("WHUT-ISP").is_some());
-        assert!(campus_wifi("WHUT-WLAN-Guest").is_none());
-        assert!(campus_wifi("OtherWiFi").is_none());
-    }
+    use super::{has_default_route_on, portal_response_has_csrf_token};
 
     // /proc/net/route 的表头
     const ROUTE_HEADER: &str =

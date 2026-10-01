@@ -20,6 +20,11 @@ pub struct Config {
     pub wired_interface: Option<String>,
 }
 
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+}
+
 impl Config {
     pub fn wired_interface(&self) -> Option<&str> {
         self.wired
@@ -50,7 +55,7 @@ impl Config {
         Ok(())
     }
 
-    pub fn update_credentials(&mut self, credentials: Config) {
+    pub fn update_credentials(&mut self, credentials: Credentials) {
         self.username = credentials.username;
         self.password = credentials.password;
     }
@@ -130,7 +135,7 @@ fn protect_config_file(file: &fs::File) -> io::Result<()> {
     Ok(())
 }
 
-pub fn prompt_config() -> Result<Config, Box<dyn Error>> {
+pub fn prompt_credentials() -> Result<Credentials, Box<dyn Error>> {
     print!("请输入校园网账号: ");
     io::stdout().flush()?;
 
@@ -149,12 +154,7 @@ pub fn prompt_config() -> Result<Config, Box<dyn Error>> {
         return Err("账号或密码为空".into());
     }
 
-    Ok(Config {
-        username,
-        password,
-        wired: false,
-        wired_interface: None,
-    })
+    Ok(Credentials { username, password })
 }
 
 pub fn save_config(config: &Config) -> Result<(), Box<dyn Error>> {
@@ -222,7 +222,14 @@ pub fn load_or_prompt_config() -> Config {
         }
         Ok(None) => {
             println!("[!] 未找到本地账号密码配置，请输入一次。");
-            prompt_config().unwrap_or_else(|err| exit_after_config_error(err))
+            let credentials =
+                prompt_credentials().unwrap_or_else(|err| exit_after_config_error(err));
+            Config {
+                username: credentials.username,
+                password: credentials.password,
+                wired: false,
+                wired_interface: None,
+            }
         }
         Err(err) => exit_after_config_error(err),
     }
@@ -351,12 +358,10 @@ mod tests {
     #[test]
     fn credential_update_preserves_wired_settings_when_saved() {
         let mut config = wired_config();
-        config.update_credentials(Config {
+        config.update_credentials(Credentials {
             username: "new-student".into(),
             // 包括 Rust Debug 转义与 TOML 转义不同的字符。
             password: "new\0密码\t\"\\".into(),
-            wired: false,
-            wired_interface: None,
         });
         let saved = toml::to_string(&config).unwrap();
         let loaded: Config = toml::from_str(&saved).unwrap();

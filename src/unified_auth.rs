@@ -11,8 +11,7 @@ use serde::Deserialize;
 use std::error::Error;
 use std::time::Duration;
 
-use crate::USER_AGENT_VALUE;
-use crate::network::client_builder;
+use crate::network::{USER_AGENT_VALUE, client_builder};
 
 const UNIFIED_LOGIN_URL: &str =
     "https://zhlgd.whut.edu.cn/tpass/login?service=https%3A%2F%2Fzhlgd.whut.edu.cn%2Ftp_up%2F";
