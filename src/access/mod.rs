@@ -30,7 +30,7 @@ impl CampusNetwork {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessBlocker {
     #[cfg(windows)]
     NotCampusWifi,

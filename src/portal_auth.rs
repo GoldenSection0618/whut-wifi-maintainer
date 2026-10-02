@@ -5,6 +5,7 @@ use std::error::Error;
 use std::time::Duration;
 
 use crate::network::{USER_AGENT_VALUE, client_builder, is_network_ok};
+use crate::unified_auth::is_credential_error;
 
 const REDIRECT_URL: &str = "http://www.msftconnecttest.com/redirect";
 pub(crate) const CSRF_TOKEN_URL: &str = "http://172.30.21.100/api/csrf-token";
@@ -16,10 +17,11 @@ struct AuthContext {
     from_redirect: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum PortalLoginOutcome {
-    Verified,
+    Verified { network_ok: bool },
     Rejected,
-    Inconclusive,
+    Inconclusive { network_ok: bool },
     BalanceInsufficient,
 }
 
@@ -41,6 +43,20 @@ fn extract_nas_id(final_url: &str) -> String {
         .unwrap_or_else(|| "52".to_string())
 }
 
+fn context_from_response(url: &reqwest::Url, status: reqwest::StatusCode) -> AuthContext {
+    let portal = reqwest::Url::parse(LOGIN_URL).expect("valid portal URL");
+    let from_redirect = status.is_success() && url.origin() == portal.origin();
+    AuthContext {
+        referer: from_redirect.then(|| url.to_string()),
+        nas_id: if from_redirect {
+            extract_nas_id(url.as_str())
+        } else {
+            "52".into()
+        },
+        from_redirect,
+    }
+}
+
 fn auth_context(client: &Client, verbose: bool) -> AuthContext {
     // 门户重定向携带当前接入点的 nasId，并可作为后续请求的 Referer。
     match client
@@ -49,19 +65,15 @@ fn auth_context(client: &Client, verbose: bool) -> AuthContext {
         .send()
     {
         Ok(resp) => {
-            let final_url = resp.url().to_string();
-            let nas_id = extract_nas_id(&final_url);
-
+            let context = context_from_response(resp.url(), resp.status());
             if verbose {
-                println!("[*] 已重定向到认证页面: {final_url}");
-                println!("[*] nasId = {nas_id}");
+                if context.from_redirect {
+                    println!("[*] 已进入校园网认证页面。");
+                } else {
+                    println!("[*] 未进入校园网认证页面，使用默认 nasId = 52 继续尝试。");
+                }
             }
-
-            AuthContext {
-                referer: Some(final_url),
-                nas_id,
-                from_redirect: true,
-            }
+            context
         }
         Err(err) => {
             if verbose {
@@ -91,6 +103,50 @@ fn response_message(result: &Value) -> Option<&str> {
         })
 }
 
+fn csrf_token(response: &Value) -> Result<&str, Box<dyn Error>> {
+    response
+        .get("csrf_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| "认证门户未提供有效的 CSRF token".into())
+}
+
+fn classify_login_response(
+    result: &Value,
+    from_redirect: bool,
+    network_check: impl FnOnce() -> bool,
+) -> Result<PortalLoginOutcome, Box<dyn Error>> {
+    if result.get("code").is_some_and(|code| !code.is_i64()) {
+        return Err("认证门户返回的 code 类型不正确".into());
+    }
+    let code = result.get("code").and_then(Value::as_i64);
+    let message = response_message(result);
+    if message.is_some_and(|message| message.contains("余额不足")) {
+        return Ok(PortalLoginOutcome::BalanceInsufficient);
+    }
+
+    let success_message = result.get("msg").and_then(Value::as_str) == Some("success");
+    let success = code == Some(0) || (code.is_none() && success_message);
+    if success {
+        if message.is_some_and(is_credential_error) {
+            return Err("认证门户返回了互相矛盾的认证结果".into());
+        }
+        let network_ok = network_check();
+        return Ok(if from_redirect {
+            PortalLoginOutcome::Verified { network_ok }
+        } else {
+            PortalLoginOutcome::Inconclusive { network_ok }
+        });
+    }
+    if success_message {
+        return Err("认证门户返回了互相矛盾的认证结果".into());
+    }
+    if message.is_some_and(is_credential_error) {
+        return Ok(PortalLoginOutcome::Rejected);
+    }
+    Err(format!("认证门户返回了未识别的认证结果（code: {code:?}）").into())
+}
+
 pub fn login(
     username: &str,
     password: &str,
@@ -106,10 +162,7 @@ pub fn login(
         .send()?
         .error_for_status()?
         .json()?;
-    let Some(csrf_token) = csrf_json.get("csrf_token").and_then(Value::as_str) else {
-        println!("[!] 获取 CSRF token 失败");
-        return Ok(PortalLoginOutcome::Rejected);
-    };
+    let csrf_token = csrf_token(&csrf_json)?;
 
     if verbose {
         println!("[*] 已获取 CSRF token");
@@ -143,31 +196,91 @@ pub fn login(
         .error_for_status()?;
     let result: Value = login_resp.json()?;
 
-    if verbose {
-        println!("[*] 登录响应: {result}");
+    classify_login_response(&result, auth_context.from_redirect, || {
+        is_network_ok(wired_interface)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn token_errors_are_not_credential_rejections() {
+        for response in [
+            json!({}),
+            json!({"csrf_token":null}),
+            json!({"csrf_token":42}),
+            json!({"csrf_token":""}),
+            json!({"csrf_token":"   "}),
+        ] {
+            assert!(csrf_token(&response).is_err());
+        }
+        let response = json!({"csrf_token":"fixture-token"});
+        assert_eq!(csrf_token(&response).unwrap(), "fixture-token");
     }
 
-    if result.get("code").and_then(Value::as_i64) == Some(0)
-        || result.get("msg").and_then(Value::as_str) == Some("success")
-    {
-        if !auth_context.from_redirect && is_network_ok(wired_interface) {
-            Ok(PortalLoginOutcome::Inconclusive)
-        } else {
-            if verbose {
-                println!("[+] 登录成功");
-            }
-            Ok(PortalLoginOutcome::Verified)
+    #[test]
+    fn a_completed_connectivity_request_is_not_a_portal_redirect() {
+        for url in [REDIRECT_URL, "http://other.invalid/login"] {
+            let context =
+                context_from_response(&reqwest::Url::parse(url).unwrap(), reqwest::StatusCode::OK);
+            assert!(!context.from_redirect);
+            assert!(context.referer.is_none());
         }
-    } else {
-        if let Some(message) = response_message(&result) {
-            // 计费失败不代表凭据错误，不能触发重新输入账号密码。
-            if message.contains("余额不足") {
-                return Ok(PortalLoginOutcome::BalanceInsufficient);
-            }
-            println!("[-] 登录失败: {message}");
-        } else {
-            println!("[-] 登录失败: {result}");
+        let portal_url = reqwest::Url::parse("http://172.30.21.100/?nasId=64").unwrap();
+        let context = context_from_response(&portal_url, reqwest::StatusCode::OK);
+        assert!(context.from_redirect);
+        assert_eq!(context.nas_id, "64");
+        assert!(
+            !context_from_response(&portal_url, reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+                .from_redirect
+        );
+    }
+
+    #[test]
+    fn accepted_requests_without_a_portal_redirect_remain_inconclusive() {
+        for network_ok in [false, true] {
+            assert_eq!(
+                classify_login_response(&json!({"code":0}), false, || network_ok).unwrap(),
+                PortalLoginOutcome::Inconclusive { network_ok }
+            );
+            assert_eq!(
+                classify_login_response(&json!({"code":0}), true, || network_ok).unwrap(),
+                PortalLoginOutcome::Verified { network_ok }
+            );
         }
-        Ok(PortalLoginOutcome::Rejected)
+    }
+
+    #[test]
+    fn unrelated_failures_and_conflicting_responses_do_not_reject_credentials() {
+        for response in [
+            json!({"code":1,"msg":"服务器忙"}),
+            json!({}),
+            json!({"code":1,"msg":"success"}),
+            json!({"code":0,"authMsg":"密码错误"}),
+            json!({"code":"1","msg":"success"}),
+            json!({"private_field":"fixture-secret"}),
+        ] {
+            let error =
+                classify_login_response(&response, true, || panic!("must not check connectivity"))
+                    .unwrap_err();
+            assert!(!error.to_string().contains("fixture-secret"));
+        }
+        assert_eq!(
+            classify_login_response(&json!({"code":1,"authMsg":"密码错误"}), true, || panic!(
+                "must not check connectivity"
+            ))
+            .unwrap(),
+            PortalLoginOutcome::Rejected
+        );
+        assert_eq!(
+            classify_login_response(&json!({"code":0,"authMsg":"余额不足"}), true, || panic!(
+                "must not check connectivity"
+            ))
+            .unwrap(),
+            PortalLoginOutcome::BalanceInsufficient
+        );
     }
 }

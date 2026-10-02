@@ -24,6 +24,7 @@ struct RsaKeyResponse {
     public_key: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum CredentialVerification {
     Valid,
     Invalid,
@@ -42,10 +43,10 @@ fn build_client(wired_interface: Option<&str>) -> Result<Client, Box<dyn Error>>
 fn hidden_input_value(html: &str, id: &str) -> Result<Option<String>, Box<dyn Error>> {
     let input_re = Regex::new(r#"(?is)<input\b[^>]*>"#)?;
     let id_re = Regex::new(&format!(
-        r#"(?i)\bid\s*=\s*[\"']{}[\"']"#,
+        r#"(?i)(?:^|\s)id\s*=\s*[\"']{}[\"']"#,
         regex::escape(id)
     ))?;
-    let value_re = Regex::new(r#"(?i)\bvalue\s*=\s*[\"']([^\"']*)[\"']"#)?;
+    let value_re = Regex::new(r#"(?i)(?:^|\s)value\s*=\s*[\"']([^\"']*)[\"']"#)?;
 
     Ok(input_re.find_iter(html).find_map(|input| {
         let input = input.as_str();
@@ -60,7 +61,7 @@ fn hidden_input_value(html: &str, id: &str) -> Result<Option<String>, Box<dyn Er
 
 fn unified_error_message(html: &str) -> Result<Option<String>, Box<dyn Error>> {
     let error_re =
-        Regex::new(r#"(?is)<[^>]*\bid\s*=\s*[\"']errormsghide[\"'][^>]*>(.*?)</[^>]+>"#)?;
+        Regex::new(r#"(?is)<[^>]*\sid\s*=\s*[\"']errormsghide[\"'][^>]*>(.*?)</[^>]+>"#)?;
     let tag_re = Regex::new(r#"(?is)<[^>]+>"#)?;
 
     Ok(error_re
@@ -73,6 +74,40 @@ fn unified_error_message(html: &str) -> Result<Option<String>, Box<dyn Error>> {
 fn encrypt(public_key: &RsaPublicKey, value: &str) -> Result<String, Box<dyn Error>> {
     let encrypted = public_key.encrypt(&mut OsRng, Pkcs1v15Encrypt, value.as_bytes())?;
     Ok(BASE64_STANDARD.encode(encrypted))
+}
+
+pub(crate) fn is_credential_error(message: &str) -> bool {
+    if ["验证码", "锁定", "过期", "维护"]
+        .iter()
+        .any(|reason| message.contains(reason))
+    {
+        return false;
+    }
+    [
+        "密码错误",
+        "密码不正确",
+        "账号不存在",
+        "帐号不存在",
+        "用户名不存在",
+        "用户不存在",
+    ]
+    .iter()
+    .any(|reason| message.contains(reason))
+}
+
+fn is_service_redirect(response_url: &reqwest::Url, location: &str) -> bool {
+    let service = reqwest::Url::parse(UNIFIED_SERVICE_URL).expect("valid unified service URL");
+    response_url.join(location).is_ok_and(|destination| {
+        destination.origin() == service.origin() && destination.path().starts_with(service.path())
+    })
+}
+
+fn classify_login_page(html: &str) -> Result<CredentialVerification, Box<dyn Error>> {
+    match unified_error_message(html)? {
+        Some(message) if is_credential_error(&message) => Ok(CredentialVerification::Invalid),
+        Some(_) => Err("统一认证返回了其他错误，无法判断账号密码是否有效".into()),
+        None => Ok(CredentialVerification::Inconclusive),
+    }
 }
 
 pub fn verify_credentials(
@@ -127,11 +162,11 @@ pub fn verify_credentials(
             .and_then(|value| value.to_str().ok())
             .ok_or("统一认证成功重定向缺少 Location 响应头")?;
 
-        if location.starts_with(UNIFIED_SERVICE_URL) {
+        if is_service_redirect(login_response.url(), location) {
             return Ok(CredentialVerification::Valid);
         }
 
-        return Err(format!("统一认证重定向到了未预期地址: {location}").into());
+        return Err("统一认证重定向到了未预期地址".into());
     }
 
     if !login_response.status().is_success() {
@@ -139,17 +174,16 @@ pub fn verify_credentials(
     }
 
     let response_html = login_response.text()?;
-    if let Some(message) = unified_error_message(&response_html)? {
-        println!("[-] 统一认证失败: {message}");
-        return Ok(CredentialVerification::Invalid);
+    let verification = classify_login_page(&response_html)?;
+    if verification == CredentialVerification::Invalid {
+        println!("[-] 统一认证返回账号或密码错误。");
     }
-
-    Ok(CredentialVerification::Inconclusive)
+    Ok(verification)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{hidden_input_value, unified_error_message};
+    use super::*;
 
     #[test]
     fn extracts_lt_from_login_page() {
@@ -169,5 +203,60 @@ mod tests {
             unified_error_message(html).unwrap(),
             Some("密码错误".to_string())
         );
+    }
+
+    #[test]
+    fn data_attributes_are_not_login_fields() {
+        let html = r#"<input data-id="lt" value="wrong">
+                      <input id="lt" data-value="wrong" value="LT-correct">"#;
+        assert_eq!(
+            hidden_input_value(html, "lt").unwrap().as_deref(),
+            Some("LT-correct")
+        );
+        assert!(
+            unified_error_message(r#"<span data-id="errormsghide">密码错误</span>"#)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn other_unified_errors_do_not_reject_credentials() {
+        for message in [
+            "验证码错误",
+            "会话已过期",
+            "系统维护中",
+            "账号已锁定",
+            "密码错误次数过多，账号已锁定",
+        ] {
+            let html = format!(r#"<span id="errormsghide">{message}</span>"#);
+            assert!(classify_login_page(&html).is_err());
+        }
+        assert_eq!(
+            classify_login_page(r#"<span id="errormsghide">用户名或密码错误</span>"#).unwrap(),
+            CredentialVerification::Invalid
+        );
+        assert_eq!(
+            classify_login_page("<html>unknown response</html>").unwrap(),
+            CredentialVerification::Inconclusive
+        );
+    }
+
+    #[test]
+    fn service_redirects_use_resolved_urls() {
+        let response_url = reqwest::Url::parse(UNIFIED_LOGIN_URL).unwrap();
+        assert!(is_service_redirect(
+            &response_url,
+            "https://zhlgd.whut.edu.cn/tp_up/?ticket=fixture"
+        ));
+        assert!(is_service_redirect(&response_url, "/tp_up/?ticket=fixture"));
+        for location in [
+            "https://zhlgd.whut.edu.cn/tp_up/../tpass/login",
+            "https://zhlgd.whut.edu.cn/tp_up/%2e%2e/tpass/login",
+            "https://zhlgd.whut.edu.cn.evil.invalid/tp_up/",
+            "http://zhlgd.whut.edu.cn/tp_up/",
+        ] {
+            assert!(!is_service_redirect(&response_url, location));
+        }
     }
 }

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::thread;
@@ -18,6 +18,8 @@ pub struct Config {
     /// 有线模式绑定的接口名（如 eth0、eth0.2、pppoe-wan）。
     #[serde(default)]
     pub wired_interface: Option<String>,
+    #[serde(skip)]
+    source_path: Option<PathBuf>,
 }
 
 pub struct Credentials {
@@ -26,6 +28,10 @@ pub struct Credentials {
 }
 
 impl Config {
+    fn has_credentials(&self) -> bool {
+        !self.username.trim().is_empty() && !self.password.is_empty()
+    }
+
     pub fn wired_interface(&self) -> Option<&str> {
         self.wired
             .then_some(self.wired_interface.as_deref())
@@ -80,17 +86,16 @@ fn load_config() -> Result<Option<(Config, PathBuf)>, Box<dyn Error>> {
     load_config_from(config_candidates())
 }
 
-fn load_config_from(paths: Vec<PathBuf>) -> Result<Option<(Config, PathBuf)>, Box<dyn Error>> {
+pub(crate) fn load_config_from(
+    paths: Vec<PathBuf>,
+) -> Result<Option<(Config, PathBuf)>, Box<dyn Error>> {
     for path in paths {
         if path.try_exists()? {
             let content = read_config_file(&path, protect_config_file)?;
-            let config: Config = toml::from_str(&content)
+            let mut config: Config = toml::from_str(&content)
                 .map_err(|_| "配置 TOML 格式或字段类型错误（为保护凭据，不显示原文）")?;
 
-            if config.username.trim().is_empty() || config.password.is_empty() {
-                return Ok(None);
-            }
-
+            config.source_path = Some(path.clone());
             return Ok(Some((config, path)));
         }
     }
@@ -136,19 +141,30 @@ fn protect_config_file(file: &fs::File) -> io::Result<()> {
 }
 
 pub fn prompt_credentials() -> Result<Credentials, Box<dyn Error>> {
-    print!("请输入校园网账号: ");
-    io::stdout().flush()?;
+    read_credentials(&mut io::stdin().lock(), &mut io::stdout().lock())
+}
+
+fn read_credentials(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<Credentials, Box<dyn Error>> {
+    write!(output, "请输入校园网账号: ")?;
+    output.flush()?;
 
     let mut username = String::new();
-    io::stdin().read_line(&mut username)?;
+    if input.read_line(&mut username)? == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "账号输入已结束").into());
+    }
     let username = username.trim().to_string();
 
-    print!("请输入校园网密码: ");
-    io::stdout().flush()?;
+    write!(output, "请输入校园网密码: ")?;
+    output.flush()?;
 
     let mut password = String::new();
-    io::stdin().read_line(&mut password)?;
-    let password = password.trim().to_string();
+    if input.read_line(&mut password)? == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "密码输入已结束").into());
+    }
+    let password = password.trim_end_matches(['\r', '\n']).to_string();
 
     if username.is_empty() || password.is_empty() {
         return Err("账号或密码为空".into());
@@ -158,7 +174,7 @@ pub fn prompt_credentials() -> Result<Credentials, Box<dyn Error>> {
 }
 
 pub fn save_config(config: &Config) -> Result<(), Box<dyn Error>> {
-    let path = config_path();
+    let path = config.source_path.clone().unwrap_or_else(config_path);
     let content = toml::to_string(config)?;
 
     write_config_file(&path, &content)?;
@@ -193,12 +209,12 @@ fn write_config_file(path: &std::path::Path, content: &str) -> io::Result<()> {
 #[cfg(not(windows))]
 pub fn load_wired_config() -> Result<Config, Box<dyn Error>> {
     match load_config() {
-        Ok(Some((config, path))) => {
+        Ok(Some((config, path))) if config.has_credentials() => {
             config.validate_wired()?;
             println!("[*] 已读取本地配置: {}", path.display());
             Ok(config)
         }
-        Ok(None) => Err(
+        Ok(_) => Err(
             "请先在 config.toml 中填写账号密码，并设置 wired = true 和 wired_interface。".into(),
         ),
         Err(err) => Err(err),
@@ -216,8 +232,15 @@ fn exit_after_config_error(err: Box<dyn Error>) -> ! {
 #[cfg(windows)]
 pub fn load_or_prompt_config() -> Config {
     match load_config() {
-        Ok(Some((config, path))) => {
+        Ok(Some((config, path))) if config.has_credentials() => {
             println!("[*] 已读取本地账号密码配置: {}", path.display());
+            config
+        }
+        Ok(Some((mut config, _))) => {
+            println!("[!] 未找到本地账号密码配置，请输入一次。");
+            let credentials =
+                prompt_credentials().unwrap_or_else(|err| exit_after_config_error(err));
+            config.update_credentials(credentials);
             config
         }
         Ok(None) => {
@@ -229,6 +252,7 @@ pub fn load_or_prompt_config() -> Config {
                 password: credentials.password,
                 wired: false,
                 wired_interface: None,
+                source_path: None,
             }
         }
         Err(err) => exit_after_config_error(err),
@@ -247,6 +271,77 @@ mod tests {
         ));
         fs::create_dir(&directory).unwrap();
         directory
+    }
+
+    #[test]
+    fn updates_are_saved_to_the_loaded_configuration_path() {
+        for previous_password in ["old", ""] {
+            let directory = test_directory();
+            let path = directory.join("config.toml");
+            fs::write(
+                &path,
+                format!("username='student'\npassword='{previous_password}'"),
+            )
+            .unwrap();
+            let (mut config, _) =
+                load_config_from(vec![directory.join("missing.toml"), path.clone()])
+                    .unwrap()
+                    .unwrap();
+            config.update_credentials(Credentials {
+                username: "new-student".into(),
+                password: " new\0密码\t\"\\ ".into(),
+            });
+            save_config(&config).unwrap();
+            let content = fs::read_to_string(&path).unwrap();
+            let saved: Config = toml::from_str(&content).unwrap();
+            assert_eq!(saved.username, "new-student");
+            assert_eq!(saved.password, config.password);
+            assert!(!content.contains("source_path"));
+            fs::remove_file(path).unwrap();
+            fs::remove_dir(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn password_whitespace_is_preserved_with_windows_line_endings() {
+        let mut input = io::Cursor::new("  student  \r\n  password with spaces  \r\n");
+        let mut output = Vec::new();
+        let credentials = read_credentials(&mut input, &mut output).unwrap();
+        assert_eq!(credentials.username, "student");
+        assert_eq!(credentials.password, "  password with spaces  ");
+        assert!(
+            !String::from_utf8(output)
+                .unwrap()
+                .contains("password with spaces")
+        );
+    }
+
+    #[test]
+    fn closed_input_is_distinct_from_an_empty_entry() {
+        for input in ["", "student\r\n"] {
+            let error = read_credentials(&mut io::Cursor::new(input), &mut Vec::new())
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
+        let error = read_credentials(&mut io::Cursor::new("student\r\n\r\n"), &mut Vec::new())
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "账号或密码为空");
+    }
+
+    #[test]
+    fn malformed_configuration_does_not_expose_credentials() {
+        let directory = test_directory();
+        let path = directory.join("config.toml");
+        fs::write(&path, "password = private-fixture-password").unwrap();
+        let error = load_config_from(vec![path.clone()]).err().unwrap();
+        assert!(!error.to_string().contains("private-fixture-password"));
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 
     #[cfg(unix)]
