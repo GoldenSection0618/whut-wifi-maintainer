@@ -1,7 +1,6 @@
 use reqwest::blocking::{Client, ClientBuilder};
 
-use crate::USER_AGENT_VALUE;
-
+pub(crate) const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const CONNECT_TEST_URL: &str = "http://www.msftconnecttest.com/connecttest.txt";
 
 pub fn client_builder(wired_interface: Option<&str>) -> ClientBuilder {
