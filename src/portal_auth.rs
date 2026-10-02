@@ -11,7 +11,7 @@ use crate::network::{USER_AGENT_VALUE, client_builder, is_network_ok};
 use crate::unified_auth::is_credential_error;
 
 const REDIRECT_URL: &str = "http://www.msftconnecttest.com/redirect";
-pub(crate) const CSRF_TOKEN_URL: &str = "http://172.30.21.100/api/csrf-token";
+const CSRF_TOKEN_URL: &str = "http://172.30.21.100/api/csrf-token";
 const LOGIN_URL: &str = "http://172.30.21.100/api/account/login";
 
 struct AuthContext {
@@ -199,13 +199,17 @@ fn login_at(
 ) -> Result<PortalLoginOutcome, Box<dyn Error>> {
     let auth_context = auth_context(&clients.discovery, verbose, endpoints.redirect);
 
-    let csrf_json: Value = clients
+    let csrf_response = clients
         .portal
         .get(endpoints.csrf)
         .timeout(Duration::from_secs(5))
         .send()?
-        .error_for_status()?
-        .json()?;
+        .error_for_status()?;
+    // 保留有线门户探测原有的成功状态要求，重定向响应不能提供有效 token。
+    if !csrf_response.status().is_success() {
+        return Err("认证门户 CSRF 接口未返回成功状态".into());
+    }
+    let csrf_json: Value = csrf_response.json()?;
     let csrf_token = csrf_token(&csrf_json)?;
 
     if verbose {
@@ -397,6 +401,52 @@ mod tests {
             outcome,
             PortalLoginOutcome::Inconclusive { network_ok: true }
         );
+    }
+
+    #[test]
+    fn invalid_portal_responses_never_submit_credentials() {
+        let mut responses = vec![
+            response("not json"),
+            response(r#"{"code":0}"#),
+            response(r#"{"csrf_token":null}"#),
+            response(r#"{"csrf_token":42}"#),
+            response(r#"{"csrf_token":""}"#),
+            response(r#"{"csrf_token":"   "}"#),
+        ];
+        for status in [302, 503] {
+            responses.push(response(r#"{"csrf_token":"fixture-token"}"#).replacen(
+                "200 OK",
+                &format!("{status} Unavailable"),
+                1,
+            ));
+        }
+        for csrf_response in responses {
+            let login_destination = TcpListener::bind("127.0.0.1:0").unwrap();
+            login_destination.set_nonblocking(true).unwrap();
+            let login_url = format!("http://{}/login", login_destination.local_addr().unwrap());
+            let (url, server) = serve(vec![response("discovery"), csrf_response]);
+            let clients = build_clients(None).unwrap();
+            let outcome = login_at(
+                &clients,
+                "student",
+                "fixture-password",
+                false,
+                &Endpoints {
+                    redirect: &url,
+                    csrf: &url,
+                    login: &login_url,
+                },
+                || panic!("invalid portal responses must not check connectivity"),
+            );
+            let requests = server.join().unwrap();
+            assert!(outcome.is_err(), "invalid portal response was accepted");
+            assert!(requests.iter().all(|request| request.starts_with("GET ")));
+            assert_eq!(
+                login_destination.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "invalid portal response must not trigger a credential POST"
+            );
+        }
     }
 
     #[test]

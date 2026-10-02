@@ -38,8 +38,6 @@ pub enum AccessBlocker {
     NotEnabled,
     #[cfg(not(windows))]
     NoDefaultRoute,
-    #[cfg(not(windows))]
-    PortalUnreachable,
 }
 
 impl AccessBlocker {
@@ -55,10 +53,6 @@ impl AccessBlocker {
             }
             #[cfg(not(windows))]
             Self::NoDefaultRoute => "[*] 绑定接口暂无可用的 IPv4 默认路由，等待接入校园网。",
-            #[cfg(not(windows))]
-            Self::PortalUnreachable => {
-                "[*] 绑定接口已有默认路由，但无法访问校园网认证门户，等待接入 WHUT 校园网。"
-            }
         }
     }
 }
