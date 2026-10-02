@@ -70,7 +70,7 @@ impl Runtime {
                 self.credentials_verified = true;
             }
             Ok(PortalLoginOutcome::Rejected) => {
-                report("[!] 认证失败，请重新输入账号密码。");
+                report("[!] 认证服务器拒绝了账号或密码。");
                 self.credentials_verified = false;
                 self.state = prompt(config, campus_network);
                 self.credentials_verified = matches!(
@@ -147,10 +147,18 @@ fn prompt_credentials_or_report() -> Option<Credentials> {
     }
 }
 
+fn replacement_credentials() -> Option<Credentials> {
+    if !std::io::stdin().is_terminal() {
+        eprintln!("[!] 账号或密码被明确拒绝；后台运行已退出，请修正配置后重启。");
+        std::process::exit(2);
+    }
+    prompt_credentials_or_report()
+}
+
 fn verify_configured_credentials(config: &mut Config) -> bool {
     verify_configured_credentials_with(
         config,
-        prompt_credentials_or_report,
+        replacement_credentials,
         |credentials, interface| {
             verify_credentials(&credentials.username, &credentials.password, interface)
         },
@@ -180,7 +188,7 @@ fn verify_configured_credentials_with(
                 return true;
             }
             Ok(CredentialVerification::Invalid) => {
-                println!("[!] 账号密码校验失败，请重新输入。");
+                println!("[!] 统一认证拒绝了账号或密码。");
                 let Some(candidate) = prompt() else {
                     return false;
                 };
@@ -205,7 +213,7 @@ fn prompt_until_verified(config: &mut Config, campus_network: CampusNetwork) -> 
     prompt_until_verified_with(
         config,
         campus_network,
-        prompt_credentials_or_report,
+        replacement_credentials,
         |credentials, interface| {
             login(
                 &credentials.username,
@@ -502,6 +510,100 @@ mod tests {
         let saved: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved.password, "candidate-password");
         remove_config(path);
+    }
+
+    #[test]
+    fn background_credential_rejection_exits_without_reading_input_or_saving() {
+        const CHILD_FLAG: &str = "WHUT_TEST_BACKGROUND_REJECTION";
+        const CONFIG_PATH: &str = "WHUT_TEST_BACKGROUND_CONFIG";
+        if let Some(flow) = std::env::var_os(CHILD_FLAG) {
+            let path = PathBuf::from(std::env::var_os(CONFIG_PATH).unwrap());
+            let (mut config, _) = config::load_config_from(vec![path]).unwrap().unwrap();
+            if flow == "portal" {
+                Runtime::default().reconnect(
+                    &mut config,
+                    CampusNetwork::Dorm,
+                    |_| Ok(PortalLoginOutcome::Rejected),
+                    |config, network| {
+                        prompt_until_verified_with(
+                            config,
+                            network,
+                            replacement_credentials,
+                            |_, _| panic!("background rejection must not retry credentials"),
+                        )
+                    },
+                    |message| println!("{message}"),
+                );
+            } else {
+                assert_eq!(flow, "unified");
+                verify_configured_credentials_with(
+                    &mut config,
+                    replacement_credentials,
+                    |_, _| Ok(CredentialVerification::Invalid),
+                    || panic!("background rejection must exit immediately"),
+                );
+            }
+            panic!("background credential rejection must terminate the process");
+        }
+
+        for flow in ["portal", "unified"] {
+            let (_, path) = stored_config();
+            let original = fs::read_to_string(&path).unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::background_credential_rejection_exits_without_reading_input_or_saving",
+                    "--nocapture",
+                ])
+                .env(CHILD_FLAG, flow)
+                .env(CONFIG_PATH, &path)
+                // Keep the pipe open: attempting to read input would block.
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("background {flow} rejection did not terminate promptly");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("请修正配置后重启"));
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("请输入校园网"));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("stored-password"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            remove_config(path);
+        }
+    }
+
+    #[test]
+    fn ambiguous_unified_results_and_transport_errors_still_retry() {
+        for transport_error in [false, true] {
+            let (mut config, path) = stored_config();
+            let original = fs::read_to_string(&path).unwrap();
+            let mut waits = 0;
+            assert!(!verify_configured_credentials_with(
+                &mut config,
+                || panic!("unconfirmed credentials must not request replacement input"),
+                |_, _| {
+                    if transport_error {
+                        Err("fixture request unavailable".into())
+                    } else {
+                        Ok(CredentialVerification::Inconclusive)
+                    }
+                },
+                || waits += 1,
+            ));
+            assert_eq!(waits, 1);
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            remove_config(path);
+        }
     }
 
     #[test]
