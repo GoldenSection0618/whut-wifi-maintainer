@@ -4,12 +4,12 @@ pub(crate) const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; 
 const CONNECT_TEST_URL: &str = "http://www.msftconnecttest.com/connecttest.txt";
 
 pub fn client_builder(wired_interface: Option<&str>) -> ClientBuilder {
-    let builder = Client::builder();
+    // 校园网检测和认证不使用代理环境变量；TUN 和透明代理由系统网络配置决定。
+    let builder = Client::builder().no_proxy();
     #[cfg(target_os = "linux")]
     if let Some(iface) = wired_interface {
-        // 路由表检查不能约束实际出口；将所有有线模式 HTTP 连接绑定到 WAN，
-        // 并禁用环境代理，避免探测或凭据经由另一个出口发出。
-        return builder.interface(iface).no_proxy();
+        // 路由表检查不能约束实际出口；将所有有线模式 HTTP 连接绑定到 WAN。
+        return builder.interface(iface);
     }
     #[cfg(not(target_os = "linux"))]
     let _ = wired_interface;
@@ -108,5 +108,116 @@ mod tests {
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::client_builder;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn proxy_environment_does_not_redirect_requests() {
+        const CHILD_SCHEME: &str = "WHUT_TEST_DIRECT_REQUEST_SCHEME";
+        if let Some(scheme) = std::env::var_os(CHILD_SCHEME) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let https = scheme == "https";
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "target received no connection");
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("target accept failed: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                if https {
+                    // Observe a direct TLS handshake without needing a certificate fixture.
+                    let mut first_byte = [0];
+                    stream.read_exact(&mut first_byte).unwrap();
+                    assert_eq!(first_byte[0], 0x16, "expected a TLS handshake record");
+                } else {
+                    let mut reader = BufReader::new(&stream);
+                    let mut request = String::new();
+                    while !request.ends_with("\r\n\r\n") {
+                        assert!(reader.read_line(&mut request).unwrap() > 0);
+                        assert!(request.len() < 8192);
+                    }
+                    assert!(request.starts_with("GET /direct "));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .unwrap();
+                }
+            });
+            let response = client_builder(None)
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap()
+                .get(format!("{}://{address}/direct", scheme.to_str().unwrap()))
+                .send();
+            server.join().unwrap();
+            if https {
+                // The target deliberately closes after observing the handshake.
+                assert!(response.is_err());
+            } else {
+                assert_eq!(response.unwrap().text().unwrap(), "ok");
+            }
+            return;
+        }
+
+        for scheme in ["http", "https"] {
+            let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+            proxy.set_nonblocking(true).unwrap();
+            let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+            // Child environments isolate proxy settings from concurrently running tests.
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "network::windows_tests::proxy_environment_does_not_redirect_requests",
+                    "--nocapture",
+                ])
+                .env(CHILD_SCHEME, scheme)
+                .env("HTTP_PROXY", &proxy_url)
+                .env("HTTPS_PROXY", &proxy_url)
+                .env("ALL_PROXY", &proxy_url)
+                .env("NO_PROXY", "")
+                .env_remove("REQUEST_METHOD")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(6);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("direct {scheme} request did not finish promptly");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{scheme} child failed: {output:?}");
+            assert_eq!(
+                proxy.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "{scheme} request reached the proxy"
+            );
+        }
     }
 }
