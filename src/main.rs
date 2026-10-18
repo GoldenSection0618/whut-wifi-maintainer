@@ -6,7 +6,7 @@ mod unified_auth;
 
 use access::{Access, AccessBlocker, CampusNetwork};
 use config::{Config, Credentials, prompt_credentials, save_config};
-use network::is_network_ok;
+use network::{ConnectivityFailure, check_connectivity};
 use portal_auth::{PortalLoginOutcome, login};
 use std::error::Error;
 use std::io::IsTerminal;
@@ -48,6 +48,7 @@ impl Runtime {
         &mut self,
         config: &mut Config,
         campus_network: CampusNetwork,
+        connectivity_failure: &ConnectivityFailure,
         attempt: impl FnOnce(&Config) -> Result<PortalLoginOutcome, Box<dyn Error>>,
         prompt: impl FnOnce(&mut Config, CampusNetwork) -> RuntimeState,
         mut report: impl FnMut(&str),
@@ -56,7 +57,7 @@ impl Runtime {
             && self.state != RuntimeState::BalanceInsufficient
             && self.state != RuntimeState::Authenticated
         {
-            report("[!] 网络不可用，正在尝试认证。");
+            report(&format!("[!] {connectivity_failure}，正在尝试认证。"));
         }
 
         match attempt(config) {
@@ -80,12 +81,16 @@ impl Runtime {
             }
             Ok(PortalLoginOutcome::Inconclusive { network_ok }) => {
                 let next_state = if network_ok {
-                    RuntimeState::AlreadyOnline
+                    RuntimeState::NetworkOk
                 } else {
                     RuntimeState::NetworkUnavailable
                 };
                 if self.state != next_state {
-                    unconfirmed_state(network_ok, &mut report);
+                    report(if network_ok {
+                        "[+] 联网复查已通过。"
+                    } else {
+                        "[!] 门户已响应，但联网复查未通过，稍后重试。"
+                    });
                 }
                 self.state = next_state;
             }
@@ -280,7 +285,8 @@ fn main() {
                 continue;
             }
         };
-        let network_ok = is_network_ok(config.wired_interface());
+        let connectivity = check_connectivity(config.wired_interface());
+        let network_ok = connectivity.is_ok();
 
         // 每次进程启动后只在已有网络时校验一次统一认证凭据。
         if !runtime.credentials_verified && network_ok {
@@ -295,10 +301,11 @@ fn main() {
                 println!("[+] 网络正常。");
                 runtime.state = RuntimeState::NetworkOk;
             }
-        } else {
+        } else if let Err(failure) = connectivity {
             runtime.reconnect(
                 config,
                 campus_network,
+                &failure,
                 |config| {
                     login(
                         &config.username,
@@ -355,6 +362,13 @@ mod tests {
         }
     }
 
+    fn failed_connectivity() -> ConnectivityFailure {
+        ConnectivityFailure {
+            http: network::ProbeFailure::Timeout,
+            https: network::ProbeFailure::Connection,
+        }
+    }
+
     #[test]
     fn first_transport_failure_is_reported_without_repeated_messages() {
         let (mut config, path) = stored_config();
@@ -364,6 +378,7 @@ mod tests {
             runtime.reconnect(
                 &mut config,
                 CampusNetwork::Dorm,
+                &failed_connectivity(),
                 |_| Err("fixture portal timeout".into()),
                 |_, _| panic!("transport failures must not prompt for credentials"),
                 |message| messages.push(message.to_string()),
@@ -372,8 +387,35 @@ mod tests {
         assert_eq!(runtime.state, RuntimeState::NetworkUnavailable);
         assert_eq!(messages.len(), 2);
         assert!(messages[0].contains("正在尝试认证"));
+        assert!(messages[0].contains("HTTP：请求超时；HTTPS：连接失败"));
         assert!(messages[1].contains("fixture portal timeout"));
         remove_config(path);
+    }
+
+    #[test]
+    fn online_recheck_does_not_revalidate_or_rewrite_existing_credentials() {
+        for credentials_verified in [false, true] {
+            let (mut config, path) = stored_config();
+            let original = fs::read_to_string(&path).unwrap();
+            let mut runtime = Runtime {
+                state: RuntimeState::NetworkUnavailable,
+                credentials_verified,
+            };
+            let mut messages = Vec::new();
+            runtime.reconnect(
+                &mut config,
+                CampusNetwork::Dorm,
+                &failed_connectivity(),
+                |_| Ok(PortalLoginOutcome::Inconclusive { network_ok: true }),
+                |_, _| panic!("a positive connectivity recheck must not request credentials"),
+                |message| messages.push(message.to_string()),
+            );
+            assert_eq!(runtime.state, RuntimeState::NetworkOk);
+            assert_eq!(runtime.credentials_verified, credentials_verified);
+            assert_eq!(messages, ["[+] 联网复查已通过。"]);
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            remove_config(path);
+        }
     }
 
     #[test]
@@ -386,6 +428,7 @@ mod tests {
             runtime.reconnect(
                 &mut config,
                 CampusNetwork::Dorm,
+                &failed_connectivity(),
                 |_| Ok(PortalLoginOutcome::Verified { network_ok }),
                 |_, _| panic!("accepted credentials must not prompt"),
                 |message| messages.push(message.to_string()),
@@ -523,6 +566,7 @@ mod tests {
                 Runtime::default().reconnect(
                     &mut config,
                     CampusNetwork::Dorm,
+                    &failed_connectivity(),
                     |_| Ok(PortalLoginOutcome::Rejected),
                     |config, network| {
                         prompt_until_verified_with(

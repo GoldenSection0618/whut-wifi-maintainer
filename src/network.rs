@@ -2,6 +2,46 @@ use reqwest::blocking::{Client, ClientBuilder};
 
 pub(crate) const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const CONNECT_TEST_URL: &str = "http://www.msftconnecttest.com/connecttest.txt";
+const HTTPS_CONNECT_TEST_URL: &str = "https://www.baidu.com/";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeFailure {
+    Client,
+    Timeout,
+    Connection,
+    Request,
+    HttpStatus(u16),
+    UnexpectedBody,
+}
+
+impl std::fmt::Display for ProbeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client => formatter.write_str("无法创建检测客户端"),
+            Self::Timeout => formatter.write_str("请求超时"),
+            Self::Connection => formatter.write_str("连接失败"),
+            Self::Request => formatter.write_str("请求或响应读取失败"),
+            Self::HttpStatus(status) => write!(formatter, "HTTP {status}"),
+            Self::UnexpectedBody => formatter.write_str("响应内容与预期不符"),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ConnectivityFailure {
+    pub http: ProbeFailure,
+    pub https: ProbeFailure,
+}
+
+impl std::fmt::Display for ConnectivityFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "两项联网检测均未通过（HTTP：{}；HTTPS：{}）",
+            self.http, self.https
+        )
+    }
+}
 
 pub fn client_builder(wired_interface: Option<&str>) -> ClientBuilder {
     // 校园网检测和认证不使用代理环境变量；TUN 和透明代理由系统网络配置决定。
@@ -17,22 +57,176 @@ pub fn client_builder(wired_interface: Option<&str>) -> ClientBuilder {
 }
 
 pub fn is_network_ok(wired_interface: Option<&str>) -> bool {
-    let client = match client_builder(wired_interface)
-        .timeout(std::time::Duration::from_secs(5))
-        .user_agent(USER_AGENT_VALUE)
-        .build()
-    {
+    check_connectivity(wired_interface).is_ok()
+}
+
+pub(crate) fn check_connectivity(wired_interface: Option<&str>) -> Result<(), ConnectivityFailure> {
+    let client = match probe_client(wired_interface) {
         Ok(client) => client,
-        Err(_) => return false,
+        Err(_) => {
+            return Err(ConnectivityFailure {
+                http: ProbeFailure::Client,
+                https: ProbeFailure::Client,
+            });
+        }
     };
 
-    // 仅 HTTP 成功还不够；被认证页劫持时，响应内容会不同。
-    match client.get(CONNECT_TEST_URL).send() {
-        Ok(resp) if resp.status().is_success() => match resp.text() {
-            Ok(text) => text.trim() == "Microsoft Connect Test",
-            Err(_) => false,
-        },
-        _ => false,
+    check_connectivity_with(
+        || probe(&client, CONNECT_TEST_URL, Some("Microsoft Connect Test")),
+        // 独立站点的 HTTPS 连接仍校验证书且不跟随重定向；单个 HTTP 站点故障不触发认证。
+        || probe(&client, HTTPS_CONNECT_TEST_URL, None),
+    )
+}
+
+fn probe_client(wired_interface: Option<&str>) -> Result<Client, reqwest::Error> {
+    client_builder(wired_interface)
+        .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(USER_AGENT_VALUE)
+        .build()
+}
+
+fn check_connectivity_with(
+    primary: impl FnOnce() -> Result<(), ProbeFailure>,
+    fallback: impl FnOnce() -> Result<(), ProbeFailure>,
+) -> Result<(), ConnectivityFailure> {
+    match primary() {
+        Ok(()) => Ok(()),
+        Err(http) => fallback().map_err(|https| ConnectivityFailure { http, https }),
+    }
+}
+
+fn probe(client: &Client, url: &str, expected_body: Option<&str>) -> Result<(), ProbeFailure> {
+    let response = client.get(url).send().map_err(probe_error)?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(ProbeFailure::HttpStatus(response.status().as_u16()));
+    }
+    if let Some(expected_body) = expected_body {
+        let body = response.text().map_err(probe_error)?;
+        if body.trim() != expected_body {
+            return Err(ProbeFailure::UnexpectedBody);
+        }
+    }
+    Ok(())
+}
+
+fn probe_error(error: reqwest::Error) -> ProbeFailure {
+    if error.is_timeout() {
+        ProbeFailure::Timeout
+    } else if error.is_connect() {
+        ProbeFailure::Connection
+    } else {
+        ProbeFailure::Request
+    }
+}
+
+#[cfg(test)]
+mod connectivity_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_single_failed_probe_does_not_mean_the_network_is_unavailable() {
+        check_connectivity_with(
+            || Ok(()),
+            || panic!("a successful primary probe must not trigger a second request"),
+        )
+        .unwrap();
+        for failure in [
+            ProbeFailure::Timeout,
+            ProbeFailure::Connection,
+            ProbeFailure::HttpStatus(302),
+            ProbeFailure::UnexpectedBody,
+        ] {
+            check_connectivity_with(|| Err(failure), || Ok(())).unwrap();
+        }
+    }
+
+    #[test]
+    fn both_probes_must_fail_and_the_reasons_are_preserved() {
+        let failure = check_connectivity_with(
+            || Err(ProbeFailure::Timeout),
+            || Err(ProbeFailure::HttpStatus(503)),
+        )
+        .unwrap_err();
+        assert_eq!(failure.http, ProbeFailure::Timeout);
+        assert_eq!(failure.https, ProbeFailure::HttpStatus(503));
+        assert_eq!(
+            failure.to_string(),
+            "两项联网检测均未通过（HTTP：请求超时；HTTPS：HTTP 503）"
+        );
+    }
+
+    #[test]
+    fn probe_rejects_redirects_errors_and_captive_portal_bodies() {
+        for (status, body, expected_body, expected) in [
+            (
+                200,
+                "Microsoft Connect Test\r\n",
+                Some("Microsoft Connect Test"),
+                Ok(()),
+            ),
+            (
+                200,
+                "<html>campus login</html>",
+                Some("Microsoft Connect Test"),
+                Err(ProbeFailure::UnexpectedBody),
+            ),
+            (
+                302,
+                "Microsoft Connect Test",
+                Some("Microsoft Connect Test"),
+                Err(ProbeFailure::HttpStatus(302)),
+            ),
+            (302, "", None, Err(ProbeFailure::HttpStatus(302))),
+            (503, "unavailable", None, Err(ProbeFailure::HttpStatus(503))),
+            (200, "", None, Ok(())),
+        ] {
+            let redirect = TcpListener::bind("127.0.0.1:0").unwrap();
+            redirect.set_nonblocking(true).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let response = format!(
+                "HTTP/1.1 {status} Response\r\nLocation: http://{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                redirect.local_addr().unwrap(),
+                body.len()
+            );
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "probe did not reach the target");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("mock accept failed: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut headers = String::new();
+                while !headers.ends_with("\r\n\r\n") {
+                    assert!(reader.read_line(&mut headers).unwrap() > 0);
+                    assert!(headers.len() < 8192);
+                }
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            let result = probe(&probe_client(None).unwrap(), &url, expected_body);
+            server.join().unwrap();
+            assert_eq!(result, expected);
+            assert_eq!(
+                redirect.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
     }
 }
 
