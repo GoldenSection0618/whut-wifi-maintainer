@@ -5,26 +5,6 @@ mod wired;
 
 use crate::config::Config;
 
-#[derive(Debug)]
-pub(crate) struct CampusAccessChanged;
-
-impl std::fmt::Display for CampusAccessChanged {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("当前未确认校园 Wi-Fi 接入，已取消本轮认证")
-    }
-}
-
-impl std::error::Error for CampusAccessChanged {}
-
-/// Windows 在认证阶段复查校园 Wi-Fi；有线模式继续由显式接口绑定约束出口。
-pub(crate) fn ensure_campus_network() -> Result<(), CampusAccessChanged> {
-    #[cfg(windows)]
-    if wifi::current_campus_network().is_none() {
-        return Err(CampusAccessChanged);
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy)]
 #[cfg_attr(not(windows), allow(dead_code))]
 pub enum CampusNetwork {

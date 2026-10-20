@@ -1,4 +1,4 @@
-use windows::Networking::Connectivity::{ConnectionProfileFilter, NetworkInformation};
+use windows::Networking::Connectivity::{NetworkConnectivityLevel, NetworkInformation};
 
 use super::CampusNetwork;
 
@@ -12,15 +12,17 @@ fn campus_wifi(ssid: &str) -> Option<CampusNetwork> {
 }
 
 pub(super) fn current_campus_network() -> Option<CampusNetwork> {
-    let filter = ConnectionProfileFilter::new().ok()?;
-    filter.SetIsConnected(true).ok()?;
-    filter.SetIsWlanConnectionProfile(true).ok()?;
-    // 查询当前关联的 Wi-Fi；无需已能访问互联网，也不遍历历史网络判断是否连接。
-    NetworkInformation::FindConnectionProfilesAsync(&filter)
-        .ok()?
-        .get()
-        .ok()?
+    NetworkInformation::GetConnectionProfiles()
+        .ok()
         .into_iter()
+        .flatten()
+        // 此列表也包含已保存但未连接的网络，必须排除无连通性的历史配置。
+        .filter(|profile| {
+            matches!(
+                profile.GetNetworkConnectivityLevel(),
+                Ok(level) if level != NetworkConnectivityLevel::None
+            )
+        })
         .filter_map(|profile| profile.WlanConnectionProfileDetails().ok())
         .filter_map(|details| details.GetConnectedSsid().ok())
         .find_map(|ssid| campus_wifi(&ssid.to_string()))

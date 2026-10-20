@@ -180,7 +180,6 @@ pub fn login(
             login: LOGIN_URL,
         },
         || is_network_ok(wired_interface),
-        crate::access::ensure_campus_network,
     )
 }
 
@@ -197,12 +196,9 @@ fn login_at(
     verbose: bool,
     endpoints: &Endpoints<'_>,
     network_check: impl FnOnce() -> bool,
-    mut ensure_access: impl FnMut() -> Result<(), crate::access::CampusAccessChanged>,
 ) -> Result<PortalLoginOutcome, Box<dyn Error>> {
-    ensure_access()?;
     let auth_context = auth_context(&clients.discovery, verbose, endpoints.redirect);
 
-    ensure_access()?;
     let csrf_response = clients
         .portal
         .get(endpoints.csrf)
@@ -235,7 +231,6 @@ fn login_at(
     );
     headers.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
 
-    ensure_access()?;
     let login_resp = clients
         .portal
         .post(endpoints.login)
@@ -253,17 +248,73 @@ fn login_at(
     }
     let result: Value = login_resp.error_for_status()?.json()?;
 
-    let outcome = classify_login_response(&result, auth_context.from_redirect, network_check)?;
-    ensure_access()?;
-    Ok(outcome)
+    classify_login_response(&result, auth_context.from_redirect, network_check)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{response, serve};
     use serde_json::json;
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
+    use std::thread::{self, JoinHandle};
+    use std::time::Instant;
+
+    // Adapted from PR #8's loopback fixtures; no campus or public endpoint is contacted.
+    fn serve(responses: Vec<String>) -> (String, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "expected request did not arrive");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("mock accept failed: {error}"),
+                    }
+                };
+                // Accepted sockets inherit nonblocking mode on Windows.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut headers = String::new();
+                while !headers.ends_with("\r\n\r\n") {
+                    assert!(reader.read_line(&mut headers).unwrap() > 0);
+                    assert!(headers.len() < 16384);
+                }
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                assert!(length < 16384);
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                requests.push(headers + &String::from_utf8(body).unwrap());
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+        (url, server)
+    }
+
+    fn response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
 
     #[test]
     fn login_redirects_never_forward_credentials_or_probe_connectivity() {
@@ -291,7 +342,6 @@ mod tests {
                     login: &url,
                 },
                 || panic!("redirected authentication must not check connectivity"),
-                || Ok(()),
             )
             .unwrap_err();
             let requests = server.join().unwrap();
@@ -334,7 +384,6 @@ mod tests {
                 checked_connectivity = true;
                 true
             },
-            || Ok(()),
         )
         .unwrap();
         let requests = server.join().unwrap();
@@ -388,7 +437,6 @@ mod tests {
                     login: &login_url,
                 },
                 || panic!("invalid portal responses must not check connectivity"),
-                || Ok(()),
             );
             let requests = server.join().unwrap();
             assert!(outcome.is_err(), "invalid portal response was accepted");
@@ -399,84 +447,6 @@ mod tests {
                 "invalid portal response must not trigger a credential POST"
             );
         }
-    }
-
-    #[test]
-    fn leaving_campus_during_portal_setup_never_submits_credentials() {
-        for cancelled_check in 0..3 {
-            let responses = vec![
-                response("discovery"),
-                response(r#"{"csrf_token":"fixture-token"}"#),
-            ];
-            let (url, server) = serve(responses.into_iter().take(cancelled_check).collect());
-            let destination = TcpListener::bind("127.0.0.1:0").unwrap();
-            destination.set_nonblocking(true).unwrap();
-            let login_url = format!("http://{}/login", destination.local_addr().unwrap());
-            let mut checks = 0;
-            let error = login_at(
-                &build_clients(None).unwrap(),
-                "student",
-                "fixture-password",
-                false,
-                &Endpoints {
-                    redirect: &url,
-                    csrf: &url,
-                    login: &login_url,
-                },
-                || panic!("cancelled authentication must not check external connectivity"),
-                || {
-                    if checks == cancelled_check {
-                        return Err(crate::access::CampusAccessChanged);
-                    }
-                    checks += 1;
-                    Ok(())
-                },
-            )
-            .unwrap_err();
-            assert!(error.is::<crate::access::CampusAccessChanged>());
-            let requests = server.join().unwrap();
-            assert_eq!(requests.len(), cancelled_check);
-            assert!(requests.iter().all(|request| request.starts_with("GET ")));
-            assert_eq!(
-                destination.accept().unwrap_err().kind(),
-                std::io::ErrorKind::WouldBlock
-            );
-        }
-    }
-
-    #[test]
-    fn leaving_campus_during_recheck_discards_the_portal_result() {
-        let (url, server) = serve(vec![
-            response("discovery"),
-            response(r#"{"csrf_token":"fixture-token"}"#),
-            response(r#"{"code":0}"#),
-        ]);
-        let connected = std::cell::Cell::new(true);
-        let error = login_at(
-            &build_clients(None).unwrap(),
-            "student",
-            "fixture-password",
-            false,
-            &Endpoints {
-                redirect: &url,
-                csrf: &url,
-                login: &url,
-            },
-            || {
-                connected.set(false);
-                true
-            },
-            || {
-                if connected.get() {
-                    Ok(())
-                } else {
-                    Err(crate::access::CampusAccessChanged)
-                }
-            },
-        )
-        .unwrap_err();
-        assert!(error.is::<crate::access::CampusAccessChanged>());
-        assert_eq!(server.join().unwrap().len(), 3);
     }
 
     #[test]

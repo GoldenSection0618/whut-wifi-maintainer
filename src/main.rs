@@ -2,8 +2,6 @@ mod access;
 mod config;
 mod network;
 mod portal_auth;
-#[cfg(test)]
-mod test_support;
 mod unified_auth;
 
 use access::{Access, AccessBlocker, CampusNetwork};
@@ -288,10 +286,6 @@ fn main() {
             }
         };
         let connectivity = check_connectivity(config.wired_interface());
-        if access::ensure_campus_network().is_err() {
-            // 检测期间可能已经切换到热点；重新进入接入检查，不使用本轮过期结果。
-            continue;
-        }
         let network_ok = connectivity.is_ok();
 
         // 每次进程启动后只在已有网络时校验一次统一认证凭据。

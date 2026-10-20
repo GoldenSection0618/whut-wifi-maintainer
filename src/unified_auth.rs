@@ -116,35 +116,10 @@ pub fn verify_credentials(
     wired_interface: Option<&str>,
 ) -> Result<CredentialVerification, Box<dyn Error>> {
     let client = build_client(wired_interface)?;
-    verify_credentials_at(
-        &client,
-        username,
-        password,
-        &Endpoints {
-            login: UNIFIED_LOGIN_URL,
-            rsa: UNIFIED_RSA_URL,
-        },
-        crate::access::ensure_campus_network,
-    )
-}
-
-struct Endpoints<'a> {
-    login: &'a str,
-    rsa: &'a str,
-}
-
-fn verify_credentials_at(
-    client: &Client,
-    username: &str,
-    password: &str,
-    endpoints: &Endpoints<'_>,
-    mut ensure_access: impl FnMut() -> Result<(), crate::access::CampusAccessChanged>,
-) -> Result<CredentialVerification, Box<dyn Error>> {
-    ensure_access()?;
 
     // 登录页会建立会话 Cookie，并提供本次提交所需的 lt。
     let login_page = client
-        .get(endpoints.login)
+        .get(UNIFIED_LOGIN_URL)
         .timeout(Duration::from_secs(10))
         .send()?
         .error_for_status()?;
@@ -153,14 +128,12 @@ fn verify_credentials_at(
         .filter(|value| !value.is_empty())
         .ok_or("统一认证登录页未提供 lt 字段")?;
 
-    ensure_access()?;
     let key_response: RsaKeyResponse = client
-        .post(endpoints.rsa)
+        .post(UNIFIED_RSA_URL)
         .timeout(Duration::from_secs(10))
         .send()?
         .error_for_status()?
         .json()?;
-    ensure_access()?;
     let public_key_der = BASE64_STANDARD.decode(key_response.public_key)?;
     let public_key = RsaPublicKey::from_public_key_der(&public_key_der)?;
 
@@ -168,7 +141,7 @@ fn verify_credentials_at(
     let encrypted_username = encrypt(&public_key, username)?;
     let encrypted_password = encrypt(&public_key, password)?;
     let login_response = client
-        .post(endpoints.login)
+        .post(UNIFIED_LOGIN_URL)
         .form(&[
             ("ua", ""),
             ("visitorId", ""),
@@ -181,7 +154,6 @@ fn verify_credentials_at(
         ])
         .timeout(Duration::from_secs(10))
         .send()?;
-    ensure_access()?;
 
     if login_response.status().is_redirection() {
         let location = login_response
@@ -202,7 +174,6 @@ fn verify_credentials_at(
     }
 
     let response_html = login_response.text()?;
-    ensure_access()?;
     let verification = classify_login_page(&response_html)?;
     if verification == CredentialVerification::Invalid {
         println!("[-] 统一认证返回账号或密码错误。");
@@ -213,52 +184,6 @@ fn verify_credentials_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{response, serve};
-
-    #[test]
-    fn leaving_campus_during_unified_setup_never_submits_credentials() {
-        for cancelled_check in 0..3 {
-            let responses = vec![
-                response(r#"<input id="lt" value="fixture-lt">"#),
-                // The connection check cancels before this key can be decoded or used.
-                response(r#"{"publicKey":"unused-fixture-key"}"#),
-            ];
-            let (url, server) = serve(responses.into_iter().take(cancelled_check).collect());
-            let login_url = format!("{url}/login");
-            let rsa_url = format!("{url}/rsa");
-            let mut checks = 0;
-            let error = verify_credentials_at(
-                &build_client(None).unwrap(),
-                "student",
-                "fixture-password",
-                &Endpoints {
-                    login: &login_url,
-                    rsa: &rsa_url,
-                },
-                || {
-                    if checks == cancelled_check {
-                        return Err(crate::access::CampusAccessChanged);
-                    }
-                    checks += 1;
-                    Ok(())
-                },
-            )
-            .unwrap_err();
-            assert!(error.is::<crate::access::CampusAccessChanged>());
-            let requests = server.join().unwrap();
-            assert_eq!(requests.len(), cancelled_check);
-            assert!(
-                requests
-                    .iter()
-                    .all(|request| !request.starts_with("POST /login "))
-            );
-            assert!(
-                requests
-                    .iter()
-                    .all(|request| !request.contains("fixture-password"))
-            );
-        }
-    }
 
     #[test]
     fn extracts_lt_from_login_page() {
