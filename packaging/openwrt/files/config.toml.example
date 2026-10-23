@@ -1,0 +1,15 @@
+# Fill in credentials and explicitly select the trusted campus WAN interface.
+username = ""
+password = ""
+wired = false
+# wired_interface = "wan"
+
+[monitor]
+interval_secs = 30
+timeout_secs = 5
+http_url = "http://www.msftconnecttest.com/connecttest.txt"
+http_expected_body = "Microsoft Connect Test"
+https_url = "https://www.baidu.com/"
+
+[portal]
+fallback_nas_id = "52"

@@ -52,7 +52,7 @@ fn invalid_startup_protects_configuration_and_exits_without_network_wait() {
         fs::write(&path, &content).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         let output = finish_promptly(Command::new(&binary).current_dir(&directory));
-        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.status.code(), Some(2));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("wired"), "{stderr}");
         assert!(!stderr.contains("fixture-secret"));

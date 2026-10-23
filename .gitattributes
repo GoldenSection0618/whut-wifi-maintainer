@@ -1,0 +1,6 @@
+*.sh text eol=lf
+*.init text eol=lf
+Makefile text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
