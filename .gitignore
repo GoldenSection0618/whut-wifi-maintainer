@@ -1,6 +1,4 @@
-__pycache__/
-*.py[cod]
-.Python
+# Local environments and credentials
 .venv/
 venv/
 env/
@@ -15,13 +13,9 @@ whut-dorm.py
 **/*.rs.bk
 
 # Cargo local/config cache
-.cargo/
+/.cargo/*
+!/.cargo/config.toml
 
 # IDE/editor local files
 .vscode/
 .idea/
-
-
-# Added by cargo
-
-/target

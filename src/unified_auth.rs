@@ -176,7 +176,7 @@ pub fn verify_credentials(
     let response_html = login_response.text()?;
     let verification = classify_login_page(&response_html)?;
     if verification == CredentialVerification::Invalid {
-        println!("[-] 统一认证返回账号或密码错误。");
+        status!("[-] 统一认证返回账号或密码错误。");
     }
     Ok(verification)
 }

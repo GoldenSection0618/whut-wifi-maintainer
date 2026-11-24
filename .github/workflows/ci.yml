@@ -28,3 +28,24 @@ jobs:
         run: cargo +stable test --locked
       - name: Build release
         run: cargo +stable build --release --locked
+      - name: Install .NET SDK
+        if: matrix.os == 'windows-latest'
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+      - name: Package Windows desktop app
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $publish = Join-Path $env:RUNNER_TEMP 'whut-wifi-winui'
+          ./windows/package.ps1 -OutputDirectory $publish
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $zip = Join-Path $env:RUNNER_TEMP 'whut-wifi-maintainer-windows-x64.zip'
+          Compress-Archive -Path (Join-Path $publish '*') -DestinationPath $zip
+      - name: Upload Windows ZIP
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ runner.temp }}/whut-wifi-maintainer-windows-x64.zip
+          archive: false
+          if-no-files-found: error

@@ -3,10 +3,6 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
-use std::thread;
-#[cfg(windows)]
-use std::time::Duration;
 
 #[derive(Deserialize, Serialize)]
 pub struct Config {
@@ -20,8 +16,11 @@ pub struct Config {
     pub wired_interface: Option<String>,
     #[serde(skip)]
     source_path: Option<PathBuf>,
+    #[serde(skip)]
+    credentials_need_save: bool,
 }
 
+#[cfg_attr(windows, derive(Deserialize))]
 pub struct Credentials {
     pub username: String,
     pub password: String,
@@ -62,8 +61,11 @@ impl Config {
     }
 
     pub fn update_credentials(&mut self, credentials: Credentials) {
-        self.username = credentials.username;
-        self.password = credentials.password;
+        if self.username != credentials.username || self.password != credentials.password {
+            self.username = credentials.username;
+            self.password = credentials.password;
+            self.credentials_need_save = true;
+        }
     }
 }
 
@@ -79,24 +81,30 @@ fn config_path() -> PathBuf {
 }
 
 fn config_candidates() -> Vec<PathBuf> {
-    vec![config_path(), PathBuf::from("config.toml")]
+    let beside_exe = config_path();
+    let in_working_dir = std::env::current_dir()
+        .map(|dir| dir.join("config.toml"))
+        .unwrap_or_else(|_| PathBuf::from("config.toml"));
+    if beside_exe == in_working_dir {
+        vec![beside_exe]
+    } else {
+        vec![beside_exe, in_working_dir]
+    }
 }
 
-fn load_config() -> Result<Option<(Config, PathBuf)>, Box<dyn Error>> {
+fn load_config() -> Result<Option<Config>, Box<dyn Error>> {
     load_config_from(config_candidates())
 }
 
-pub(crate) fn load_config_from(
-    paths: Vec<PathBuf>,
-) -> Result<Option<(Config, PathBuf)>, Box<dyn Error>> {
+pub(crate) fn load_config_from(paths: Vec<PathBuf>) -> Result<Option<Config>, Box<dyn Error>> {
     for path in paths {
         if path.try_exists()? {
             let content = read_config_file(&path, protect_config_file)?;
             let mut config: Config = toml::from_str(&content)
                 .map_err(|_| "配置 TOML 格式或字段类型错误（为保护凭据，不显示原文）")?;
 
-            config.source_path = Some(path.clone());
-            return Ok(Some((config, path)));
+            config.source_path = Some(path);
+            return Ok(Some(config));
         }
     }
 
@@ -173,12 +181,24 @@ fn read_credentials(
     Ok(Credentials { username, password })
 }
 
-pub fn save_config(config: &Config) -> Result<(), Box<dyn Error>> {
-    let path = config.source_path.clone().unwrap_or_else(config_path);
+pub fn save_changed_credentials(config: &mut Config) -> Result<(), Box<dyn Error>> {
+    if !config.credentials_need_save {
+        return Ok(());
+    }
+
+    let new_path;
+    let path = match &config.source_path {
+        Some(path) => path,
+        None => {
+            new_path = config_path();
+            &new_path
+        }
+    };
     let content = toml::to_string(config)?;
 
-    write_config_file(&path, &content)?;
-    println!("[*] 账号密码已保存到: {}", path.display());
+    write_config_file(path, &content)?;
+    status!("[*] 账号密码已保存到: {}", path.display());
+    config.credentials_need_save = false;
     Ok(())
 }
 
@@ -209,8 +229,12 @@ fn write_config_file(path: &std::path::Path, content: &str) -> io::Result<()> {
 #[cfg(not(windows))]
 pub fn load_wired_config() -> Result<Config, Box<dyn Error>> {
     match load_config() {
-        Ok(Some((config, path))) if config.has_credentials() => {
+        Ok(Some(config)) if config.has_credentials() => {
             config.validate_wired()?;
+            let path = config
+                .source_path
+                .as_ref()
+                .expect("loaded config has a path");
             println!("[*] 已读取本地配置: {}", path.display());
             Ok(config)
         }
@@ -222,41 +246,42 @@ pub fn load_wired_config() -> Result<Config, Box<dyn Error>> {
 }
 
 #[cfg(windows)]
-fn exit_after_config_error(err: Box<dyn Error>) -> ! {
-    eprintln!("[!] {err}");
-    eprintln!("[!] 程序将在 10 秒后退出。");
-    thread::sleep(Duration::from_secs(10));
-    std::process::exit(1);
-}
+pub fn load_or_prompt_config() -> Result<Option<Config>, Box<dyn Error>> {
+    let mut config = match load_config()? {
+        Some(config) if config.has_credentials() => {
+            let path = config
+                .source_path
+                .as_ref()
+                .expect("loaded config has a path");
+            status!("[*] 已读取本地账号密码配置: {}", path.display());
+            return Ok(Some(config));
+        }
+        Some(config) => config,
+        None => Config {
+            username: String::new(),
+            password: String::new(),
+            wired: false,
+            wired_interface: None,
+            source_path: None,
+            credentials_need_save: false,
+        },
+    };
 
-#[cfg(windows)]
-pub fn load_or_prompt_config() -> Config {
-    match load_config() {
-        Ok(Some((config, path))) if config.has_credentials() => {
-            println!("[*] 已读取本地账号密码配置: {}", path.display());
-            config
-        }
-        Ok(Some((mut config, _))) => {
-            println!("[!] 未找到本地账号密码配置，请输入一次。");
-            let credentials =
-                prompt_credentials().unwrap_or_else(|err| exit_after_config_error(err));
-            config.update_credentials(credentials);
-            config
-        }
-        Ok(None) => {
-            println!("[!] 未找到本地账号密码配置，请输入一次。");
-            let credentials =
-                prompt_credentials().unwrap_or_else(|err| exit_after_config_error(err));
-            Config {
-                username: credentials.username,
-                password: credentials.password,
-                wired: false,
-                wired_interface: None,
-                source_path: None,
-            }
-        }
-        Err(err) => exit_after_config_error(err),
-    }
+    let path = if let Some(path) = &config.source_path {
+        status!("[!] 配置中缺少账号或密码，请在下方填写。");
+        path.clone()
+    } else {
+        status!("[!] 未找到配置文件，请在下方填写账号密码。");
+        config_path()
+    };
+    status!("[*] 验证通过后将保存到 {}", path.display());
+    let credentials = match crate::interaction::window_credentials() {
+        Some(Some(credentials)) => credentials,
+        Some(None) => return Ok(None),
+        None => prompt_credentials()?,
+    };
+    config.update_credentials(credentials);
+    Ok(Some(config))
 }
 
 #[cfg(test)]
@@ -283,15 +308,14 @@ mod tests {
                 format!("username='student'\npassword='{previous_password}'"),
             )
             .unwrap();
-            let (mut config, _) =
-                load_config_from(vec![directory.join("missing.toml"), path.clone()])
-                    .unwrap()
-                    .unwrap();
+            let mut config = load_config_from(vec![directory.join("missing.toml"), path.clone()])
+                .unwrap()
+                .unwrap();
             config.update_credentials(Credentials {
                 username: "new-student".into(),
                 password: " new\0密码\t\"\\ ".into(),
             });
-            save_config(&config).unwrap();
+            save_changed_credentials(&mut config).unwrap();
             let content = fs::read_to_string(&path).unwrap();
             let saved: Config = toml::from_str(&content).unwrap();
             assert_eq!(saved.username, "new-student");

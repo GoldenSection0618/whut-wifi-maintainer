@@ -13,11 +13,8 @@ pub(super) fn current_campus_network(config: &Config) -> Result<CampusNetwork, A
         return Err(AccessBlocker::NoDefaultRoute);
     }
 
-    if campus_portal_reachable(iface) {
-        Ok(CampusNetwork::Wired)
-    } else {
-        Err(AccessBlocker::PortalUnreachable)
-    }
+    // 先检测外网；需要认证时由登录流程检查门户并校验 CSRF token。
+    Ok(CampusNetwork::Wired)
 }
 
 fn has_default_route_on_iface(iface: &str) -> bool {
@@ -50,45 +47,9 @@ fn has_default_route_on(content: &str, iface: &str) -> bool {
     })
 }
 
-fn campus_portal_reachable(iface: &str) -> bool {
-    // 检查所选接口上的门户可达性；HTTP token 本身不能证明服务器身份。
-    use std::time::Duration;
-
-    use crate::network::client_builder;
-    use crate::portal_auth::CSRF_TOKEN_URL;
-
-    let Ok(client) = client_builder(Some(iface))
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(3))
-        .build()
-    else {
-        return false;
-    };
-
-    client
-        .get(CSRF_TOKEN_URL)
-        .send()
-        .ok()
-        .filter(|resp| resp.status().is_success())
-        .and_then(|resp| resp.text().ok())
-        .is_some_and(|body| portal_response_has_csrf_token(&body))
-}
-
-// 门户响应必须包含非空 CSRF token；这只是可达性检查，不是身份认证。
-fn portal_response_has_csrf_token(body: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|json| {
-            json.get("csrf_token")
-                .and_then(serde_json::Value::as_str)
-                .map(|token| !token.trim().is_empty())
-        })
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{has_default_route_on, portal_response_has_csrf_token};
+    use super::has_default_route_on;
 
     // /proc/net/route 的表头
     const ROUTE_HEADER: &str =
@@ -152,25 +113,5 @@ mod tests {
                 "eth0"
             ));
         }
-    }
-
-    #[test]
-    fn accepts_valid_csrf_token_response() {
-        assert!(portal_response_has_csrf_token(
-            r#"{"csrf_token":"jw_8-3wDi2wj4Ayi7bYYmGQXbtk="}"#
-        ));
-    }
-
-    #[test]
-    fn rejects_missing_or_empty_csrf_token() {
-        // 空 token 不可用，必须拒绝
-        assert!(!portal_response_has_csrf_token(r#"{"csrf_token":""}"#));
-        assert!(!portal_response_has_csrf_token(r#"{"csrf_token":"   "}"#));
-        assert!(!portal_response_has_csrf_token(r#"{"csrf_token":null}"#));
-        assert!(!portal_response_has_csrf_token(r#"{"csrf_token":42}"#));
-        // 字段缺失
-        assert!(!portal_response_has_csrf_token(r#"{"code":0}"#));
-        // 非法 JSON
-        assert!(!portal_response_has_csrf_token("not json"));
     }
 }
