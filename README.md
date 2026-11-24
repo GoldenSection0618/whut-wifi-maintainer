@@ -18,7 +18,7 @@
 
 ### Windows
 
-解压 Windows 版后运行 `WhutWifi.WinUI.exe`，连接校园 Wi-Fi 后按提示输入账号密码。凭据验证通过后保存到程序同目录的 `config.toml`，之后自动读取。升级时可继续使用原有的 `config.toml`。
+解压 Windows 版后运行 `whut-wifi-maintainer.exe`，连接校园 Wi-Fi 后按提示输入账号密码。凭据验证通过后保存到程序同目录的 `config.toml`，之后自动读取。升级时请将完整新版解压到干净目录，并复制原有的 `config.toml`。
 
 关闭窗口后，程序会留在系统托盘继续保活。点击托盘图标可恢复窗口，右键选择「退出」可停止程序。
 

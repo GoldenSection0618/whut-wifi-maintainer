@@ -13,7 +13,8 @@ whut-dorm.py
 **/*.rs.bk
 
 # Cargo local/config cache
-.cargo/
+/.cargo/*
+!/.cargo/config.toml
 
 # IDE/editor local files
 .vscode/
