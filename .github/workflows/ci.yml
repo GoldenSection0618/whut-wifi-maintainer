@@ -28,3 +28,31 @@ jobs:
         run: cargo +stable test --locked
       - name: Build release
         run: cargo +stable build --release --locked
+      - name: Install .NET SDK
+        if: matrix.os == 'windows-latest'
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+      - name: Package Windows desktop app
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $worker = (Resolve-Path -LiteralPath target/release/whut-wifi-maintainer.exe).Path
+          $publish = Join-Path $env:RUNNER_TEMP 'whut-wifi-winui'
+          dotnet publish windows/WhutWifi.WinUI.csproj -c Release -o $publish "-p:KeepaliveBinary=$worker"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          foreach ($file in 'WhutWifi.WinUI.exe', 'WhutWifi.WinUI.pri', 'whut-wifi-worker.exe', 'Assets/wifi.ico') {
+            if (!(Test-Path -LiteralPath (Join-Path $publish $file) -PathType Leaf)) {
+              throw "Windows package is missing $file"
+            }
+          }
+          $zip = Join-Path $env:RUNNER_TEMP 'whut-wifi-maintainer-windows-x64.zip'
+          Compress-Archive -Path (Join-Path $publish '*') -DestinationPath $zip
+      - name: Upload Windows ZIP
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ runner.temp }}/whut-wifi-maintainer-windows-x64.zip
+          archive: false
+          if-no-files-found: error
