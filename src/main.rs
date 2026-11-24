@@ -1,15 +1,21 @@
+#[macro_use]
+mod interaction;
+#[cfg(windows)]
+mod windows_worker;
+
 mod access;
 mod config;
 mod network;
 mod portal_auth;
 mod unified_auth;
 
-use access::{Access, AccessBlocker, CampusNetwork};
-use config::{Config, Credentials, prompt_credentials, save_config};
+use access::{Access, AccessBlocker, CampusNetwork, Connection};
+use config::{Config, Credentials, prompt_credentials, save_changed_credentials};
 use network::{ConnectivityFailure, check_connectivity};
 use portal_auth::{PortalLoginOutcome, login};
 use std::error::Error;
 use std::io::IsTerminal;
+use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 use unified_auth::{CredentialVerification, verify_credentials};
@@ -62,9 +68,7 @@ impl Runtime {
 
         match attempt(config) {
             Ok(PortalLoginOutcome::Verified { network_ok }) => {
-                if !self.credentials_verified
-                    && let Err(err) = save_config(config)
-                {
+                if let Err(err) = save_changed_credentials(config) {
                     report(&format!("[!] 账号密码可用，但保存失败: {err}"));
                 }
                 self.state = authenticated_state(network_ok, &mut report);
@@ -139,7 +143,7 @@ fn prompt_credentials_or_report() -> Option<Credentials> {
     match prompt_credentials() {
         Ok(credentials) => Some(credentials),
         Err(err) => {
-            println!("[!] 未更新账号密码: {err}");
+            status!("[!] 未更新账号密码: {err}");
             if err
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof)
@@ -153,6 +157,10 @@ fn prompt_credentials_or_report() -> Option<Credentials> {
 }
 
 fn replacement_credentials() -> Option<Credentials> {
+    #[cfg(windows)]
+    if let Some(result) = interaction::window_credentials() {
+        return result;
+    }
     if !std::io::stdin().is_terminal() {
         eprintln!("[!] 账号或密码被明确拒绝；后台运行已退出，请修正配置后重启。");
         std::process::exit(2);
@@ -167,7 +175,7 @@ fn verify_configured_credentials(config: &mut Config) -> bool {
         |credentials, interface| {
             verify_credentials(&credentials.username, &credentials.password, interface)
         },
-        || thread::sleep(Duration::from_secs(CAMPUS_CHECK_INTERVAL_SECS)),
+        || interaction::wait(Duration::from_secs(CAMPUS_CHECK_INTERVAL_SECS)),
     )
 }
 
@@ -177,7 +185,7 @@ fn verify_configured_credentials_with(
     mut verify: impl FnMut(&Credentials, Option<&str>) -> Result<CredentialVerification, Box<dyn Error>>,
     mut wait: impl FnMut(),
 ) -> bool {
-    println!("[*] 当前网络已连接，正在通过统一认证校验账号密码...");
+    status!("[*] 当前网络已连接，正在通过统一认证校验账号密码...");
     let mut credentials = Credentials {
         username: config.username.clone(),
         password: config.password.clone(),
@@ -186,27 +194,27 @@ fn verify_configured_credentials_with(
         match verify(&credentials, config.wired_interface()) {
             Ok(CredentialVerification::Valid) => {
                 config.update_credentials(credentials);
-                if let Err(err) = save_config(config) {
-                    println!("[!] 账号密码校验成功，但保存失败: {err}");
+                if let Err(err) = save_changed_credentials(config) {
+                    status!("[!] 账号密码校验成功，但保存失败: {err}");
                 }
-                println!("[+] 账号密码校验成功。");
+                status!("[+] 账号密码校验成功。");
                 return true;
             }
             Ok(CredentialVerification::Invalid) => {
-                println!("[!] 统一认证拒绝了账号或密码。");
+                status!("[!] 统一认证拒绝了账号或密码。");
                 let Some(candidate) = prompt() else {
                     return false;
                 };
                 credentials = candidate;
             }
             Ok(CredentialVerification::Inconclusive) => {
-                println!("[!] 统一认证未返回明确结果，10 秒后重试。");
+                status!("[!] 统一认证未返回明确结果，10 秒后重试。");
                 wait();
                 return false;
             }
             Err(err) => {
-                println!("[!] 无法完成统一认证校验: {err}");
-                println!("[!] 10 秒后重试。");
+                status!("[!] 无法完成统一认证校验: {err}");
+                status!("[!] 10 秒后重试。");
                 wait();
                 return false;
             }
@@ -238,54 +246,78 @@ fn prompt_until_verified_with(
 ) -> RuntimeState {
     loop {
         let Some(credentials) = prompt() else {
+            if interaction::stopping() {
+                return RuntimeState::Unknown;
+            }
             continue;
         };
 
         match attempt(&credentials, config.wired_interface()) {
             Ok(PortalLoginOutcome::Verified { network_ok }) => {
                 config.update_credentials(credentials);
-                if let Err(err) = save_config(config) {
-                    println!("[!] 账号密码可用，但保存失败: {err}");
+                if let Err(err) = save_changed_credentials(config) {
+                    status!("[!] 账号密码可用，但保存失败: {err}");
                 }
-                return authenticated_state(network_ok, &mut |message| println!("{message}"));
+                return authenticated_state(network_ok, &mut |message| status!("{message}"));
             }
             Ok(PortalLoginOutcome::Rejected) => {
-                println!("[!] 账号密码仍然不正确，请重新输入。");
+                status!("[!] 账号密码仍然不正确，请重新输入。");
             }
             Ok(PortalLoginOutcome::Inconclusive { network_ok }) => {
-                return unconfirmed_state(network_ok, &mut |message| println!("{message}"));
+                return unconfirmed_state(network_ok, &mut |message| status!("{message}"));
             }
             Ok(PortalLoginOutcome::BalanceInsufficient) => {
-                println!("[!] {}", campus_network.balance_insufficient_tip());
+                status!("[!] {}", campus_network.balance_insufficient_tip());
                 return RuntimeState::BalanceInsufficient;
             }
             Err(err) => {
-                println!("[!] 重试认证异常: {err}");
+                status!("[!] 重试认证异常: {err}");
                 return RuntimeState::NetworkUnavailable;
             }
         }
     }
 }
 
-fn main() {
+fn main() -> ExitCode {
+    #[cfg(windows)]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--winui-worker")
+    {
+        windows_worker::connect();
+    }
+    run_keepalive()
+}
+
+fn run_keepalive() -> ExitCode {
     let mut access = Access::new();
     let mut runtime = Runtime::default();
 
-    println!("WHUT WiFi 保持器已启动。");
+    status!("WHUT WiFi 保持器已启动。");
 
-    loop {
+    while !interaction::stopping() {
         let (campus_network, config) = match access.connected_config() {
-            Ok(connection) => connection,
-            Err(reason) => {
+            Connection::Active(network, config) => (network, config),
+            #[cfg(windows)]
+            Connection::Cancelled => return ExitCode::SUCCESS,
+            #[cfg(windows)]
+            Connection::ConfigError(error) => {
+                interaction::report_error(format_args!("[!] 无法加载账号配置: {error}"));
+                return ExitCode::FAILURE;
+            }
+            Connection::Blocked(reason) => {
                 if runtime.state != RuntimeState::OutsideCampus(reason) {
-                    println!("{}", reason.message());
+                    status!("{}", reason.message());
                     runtime.state = RuntimeState::OutsideCampus(reason);
                 }
-                thread::sleep(Duration::from_secs(CAMPUS_CHECK_INTERVAL_SECS));
+                interaction::wait(Duration::from_secs(CAMPUS_CHECK_INTERVAL_SECS));
                 continue;
             }
         };
         let connectivity = check_connectivity(config.wired_interface());
+        if interaction::stopping() {
+            return ExitCode::SUCCESS;
+        }
         let network_ok = connectivity.is_ok();
 
         // 每次进程启动后只在已有网络时校验一次统一认证凭据。
@@ -298,7 +330,7 @@ fn main() {
 
         if network_ok {
             if runtime.state != RuntimeState::NetworkOk {
-                println!("[+] 网络正常。");
+                status!("[+] 网络正常。");
                 runtime.state = RuntimeState::NetworkOk;
             }
         } else if let Err(failure) = connectivity {
@@ -315,12 +347,13 @@ fn main() {
                     )
                 },
                 prompt_until_verified,
-                |message| println!("{message}"),
+                |message| status!("{message}"),
             );
         }
 
-        thread::sleep(Duration::from_secs(CHECK_INTERVAL_SECS));
+        interaction::wait(Duration::from_secs(CHECK_INTERVAL_SECS));
     }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]
@@ -341,10 +374,10 @@ mod tests {
         let path = directory.join("config.toml");
         fs::write(
             &path,
-            "username='stored-student'\npassword='stored-password'",
+            "# Deployment settings\nusername='stored-student'\npassword='stored-password'",
         )
         .unwrap();
-        let (config, _) = config::load_config_from(vec![path.clone()])
+        let config = config::load_config_from(vec![path.clone()])
             .unwrap()
             .unwrap();
         (config, path)
@@ -556,12 +589,26 @@ mod tests {
     }
 
     #[test]
+    fn verified_unchanged_credentials_do_not_rewrite_config() {
+        let (mut config, path) = stored_config();
+        let original = fs::read_to_string(&path).unwrap();
+        assert!(verify_configured_credentials_with(
+            &mut config,
+            || panic!("valid credentials must not prompt"),
+            |_, _| Ok(CredentialVerification::Valid),
+            || panic!("valid credentials do not require waiting"),
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        remove_config(path);
+    }
+
+    #[test]
     fn background_credential_rejection_exits_without_reading_input_or_saving() {
         const CHILD_FLAG: &str = "WHUT_TEST_BACKGROUND_REJECTION";
         const CONFIG_PATH: &str = "WHUT_TEST_BACKGROUND_CONFIG";
         if let Some(flow) = std::env::var_os(CHILD_FLAG) {
             let path = PathBuf::from(std::env::var_os(CONFIG_PATH).unwrap());
-            let (mut config, _) = config::load_config_from(vec![path]).unwrap().unwrap();
+            let mut config = config::load_config_from(vec![path]).unwrap().unwrap();
             if flow == "portal" {
                 Runtime::default().reconnect(
                     &mut config,

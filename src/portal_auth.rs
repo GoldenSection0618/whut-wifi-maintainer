@@ -83,17 +83,17 @@ fn auth_context(client: &Client, verbose: bool, redirect_url: &str) -> AuthConte
             let context = context_from_response(resp.url(), resp.status());
             if verbose {
                 if context.from_redirect {
-                    println!("[*] 已进入校园网认证页面。");
+                    status!("[*] 已进入校园网认证页面。");
                 } else {
-                    println!("[*] 未进入校园网认证页面，使用默认 nasId = 52 继续尝试。");
+                    status!("[*] 未进入校园网认证页面，使用默认 nasId = 52 继续尝试。");
                 }
             }
             context
         }
         Err(err) => {
             if verbose {
-                println!("[!] 重定向检查失败: {err}");
-                println!("[*] 使用默认 nasId = 52 继续尝试");
+                status!("[!] 重定向检查失败: {err}");
+                status!("[*] 使用默认 nasId = 52 继续尝试");
             }
 
             AuthContext {
@@ -213,7 +213,7 @@ fn login_at(
     let csrf_token = csrf_token(&csrf_json)?;
 
     if verbose {
-        println!("[*] 已获取 CSRF token");
+        status!("[*] 已获取 CSRF token");
     }
 
     let mut headers = HeaderMap::new();

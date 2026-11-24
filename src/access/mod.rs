@@ -64,6 +64,15 @@ pub struct Access {
     config: Config,
 }
 
+pub enum Connection<'a> {
+    Active(CampusNetwork, &'a mut Config),
+    Blocked(AccessBlocker),
+    #[cfg(windows)]
+    Cancelled,
+    #[cfg(windows)]
+    ConfigError(Box<dyn std::error::Error>),
+}
+
 impl Access {
     pub fn new() -> Self {
         #[cfg(windows)]
@@ -89,19 +98,27 @@ impl Access {
     }
 
     /// Windows 连接校园 Wi-Fi 后才读取配置；有线模式启动时已加载配置。
-    pub fn connected_config(&mut self) -> Result<(CampusNetwork, &mut Config), AccessBlocker> {
+    pub fn connected_config(&mut self) -> Connection<'_> {
         #[cfg(windows)]
         {
-            let network = wifi::current_campus_network().ok_or(AccessBlocker::NotCampusWifi)?;
-            let config = self
-                .config
-                .get_or_insert_with(crate::config::load_or_prompt_config);
-            Ok((network, config))
+            let Some(network) = wifi::current_campus_network() else {
+                return Connection::Blocked(AccessBlocker::NotCampusWifi);
+            };
+            if self.config.is_none() {
+                self.config = match crate::config::load_or_prompt_config() {
+                    Ok(Some(config)) => Some(config),
+                    Ok(None) => return Connection::Cancelled,
+                    Err(error) => return Connection::ConfigError(error),
+                };
+            }
+            Connection::Active(network, self.config.as_mut().expect("config loaded"))
         }
         #[cfg(not(windows))]
         {
-            let network = wired::current_campus_network(&self.config)?;
-            Ok((network, &mut self.config))
+            match wired::current_campus_network(&self.config) {
+                Ok(network) => Connection::Active(network, &mut self.config),
+                Err(reason) => Connection::Blocked(reason),
+            }
         }
     }
 }
