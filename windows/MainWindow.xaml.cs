@@ -1,8 +1,9 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
-using System.Windows.Input;
+using H.NotifyIcon.Core;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Input;
@@ -12,26 +13,52 @@ namespace WhutWifi;
 public sealed partial class MainWindow : Window
 {
     private readonly Queue<string> logs = new();
+    private readonly TrayIcon trayIcon = new();
     private Process? worker;
     private Task credentialWrite = Task.CompletedTask;
     private bool exiting;
 
-    public ICommand OpenCommand { get; }
-    public ICommand ExitCommand { get; }
-
     public MainWindow()
     {
-        OpenCommand = new TrayCommand(OpenWindow);
-        ExitCommand = new TrayCommand(Exit);
         InitializeComponent();
         var iconPath = Path.Combine(AppContext.BaseDirectory, "Assets", "wifi.ico");
         CaptionIcon.Source = new Microsoft.UI.Xaml.Media.Imaging.BitmapImage(new Uri(iconPath));
         var trayImage = new System.Drawing.Icon(iconPath, 32, 32);
-        TrayIcon.Icon = trayImage;
+        trayIcon.UpdateIcon(trayImage.Handle);
+        trayIcon.UpdateToolTip(Title);
+        var menu = new PopupMenu();
+        menu.Items.Add(new PopupMenuItem("打开窗口", (_, _) => OpenWindow()));
+        menu.Items.Add(new PopupMenuItem("退出", (_, _) => Exit()));
+        void ShowTrayMenu(System.Drawing.Point point)
+        {
+            var owner = trayIcon.WindowHandle;
+            _ = SetForegroundWindow(owner);
+            menu.Show(owner, point.X, point.Y);
+        }
+
+        trayIcon.MessageWindow.MouseEventReceived += (_, args) =>
+        {
+            if (args.MouseEvent == MouseEvent.IconLeftMouseUp)
+                OpenWindow();
+            else if (args.MouseEvent == MouseEvent.IconRightMouseUp)
+                ShowTrayMenu(args.Point);
+        };
+        trayIcon.MessageWindow.KeyboardEventReceived += (_, args) =>
+        {
+            if (args.KeyboardEvent == KeyboardEvent.KeySelect)
+                OpenWindow();
+            else if (args.KeyboardEvent == KeyboardEvent.ContextMenu)
+                ShowTrayMenu(args.Point);
+        };
+        trayIcon.MessageWindow.TaskbarCreated += (_, _) =>
+        {
+            trayIcon.TryRemove();
+            CreateTrayIcon();
+        };
         AppWindow.SetIcon(iconPath);
         Closed += (_, _) =>
         {
-            TrayIcon.Dispose();
+            trayIcon.Dispose();
             trayImage.Dispose();
         };
         CaptionTitle.Text = Title;
@@ -71,7 +98,7 @@ public sealed partial class MainWindow : Window
                 args.Cancel = worker is not null;
                 return;
             }
-            if (!TrayIcon.IsCreated)
+            if (!trayIcon.IsCreated)
                 return;
             args.Cancel = true;
             AppWindow.Hide();
@@ -80,11 +107,25 @@ public sealed partial class MainWindow : Window
 
     internal void Start()
     {
-        TrayIcon.ForceCreate(enablesEfficiencyMode: false);
-        if (!TrayIcon.IsCreated)
-            Report("[!] 系统托盘图标不可用。");
+        CreateTrayIcon();
         _ = RunWorkerAsync();
     }
+
+    private void CreateTrayIcon()
+    {
+        try
+        {
+            trayIcon.Create();
+        }
+        catch (InvalidOperationException error)
+        {
+            Report($"[!] 系统托盘图标不可用：{error.Message}");
+        }
+    }
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindow(nint window);
 
     private async Task RunWorkerAsync()
     {
@@ -235,12 +276,5 @@ public sealed partial class MainWindow : Window
             if (!exiting)
                 Report("[!] 无法提交凭据，保活进程的输入已关闭。");
         }
-    }
-
-    private sealed class TrayCommand(Action execute) : ICommand
-    {
-        public event EventHandler? CanExecuteChanged { add { } remove { } }
-        public bool CanExecute(object? parameter) => true;
-        public void Execute(object? parameter) => execute();
     }
 }

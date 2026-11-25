@@ -1,6 +1,6 @@
 # Windows 桌面版
 
-界面使用 WinUI 3，托盘沿用 [H.NotifyIcon 的 WinUI 示例](https://github.com/HavenDV/H.NotifyIcon/tree/master/src/apps/H.NotifyIcon.Apps.WinUI)。保活和配置由同目录的 Rust 工作进程负责。
+界面使用 WinUI 3，托盘使用 [H.NotifyIcon 核心库](https://github.com/HavenDV/H.NotifyIcon)。保活和配置由同目录的 Rust 工作进程负责。
 
 在 Windows x64 上安装 .NET 10 SDK 和 Rust Windows 构建工具后，从仓库根目录执行：
 
